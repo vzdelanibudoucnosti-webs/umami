@@ -100,6 +100,25 @@ Postgresem. Server-side tracking objem zápisů podle sekce 4 ještě zvýší.
 Ověřeno dnes: `/s/api/send` vrací z téhle sítě **403** na obou napojených webech.
 Prázdný dashboard po testu pak vypadá jako rozbité měření.
 
+**F13 — server-side tracking dnes vrací 500.** Chybějící geo databáze na Vercelu +
+nechycená výjimka. Podrobně v 4.0. **Opraveno v tomhle repu** (`57f733070`), zbývá
+nastavit `BUILD_GEO=1`.
+
+**F14 — `IGNORE_IP` jde obejít jednou hlavičkou.** `true-client-ip` je první
+v `IP_ADDRESS_HEADERS` (`src/lib/ip.ts:5`) a Vercel ji nenastavuje ani nestriptuje,
+takže hodnota od volajícího vyhraje. Změřeno: request, který bez hlavičky vrací **403**,
+s `true-client-ip: 8.8.8.8` vrací **200**. Protože je `/api/send` bez autentizace
+a `websiteId` je veřejné, může kdokoli zapisovat události pod libovolnou IP, lokalitou
+a session. `x-forwarded-for` ani `x-vercel-forwarded-for` podvrhnout nejdou — Vercel
+je přepisuje. **Oprava je konfigurační:** `CLIENT_IP_HEADER=x-vercel-forwarded-for`.
+Detaily a měření v `vzb-docs/umami-instance-config.md`.
+
+**F15 — middleware tracking už jednou zaveden byl a byl zrušen.**
+`lib/analytics/pxClient.ts:3-5` na hlavním webu: dřívější širší middleware způsobil
+**16 656 invokací za 24 hodin**, proto se zrušil a serverová vrstva `/api/px` dnes měří
+jen allowlist pěti cest trychtýře. Kdokoli navrhne middleware měření, znovu otevírá
+rozhodnutí, které tenhle repo už jednou otočil — a má na to vlastní produkční číslo.
+
 ### Co je naopak v pořádku (a nemá se na to sahat)
 
 - Instance je zdravá, rychlá, API správně gated (401), CSP i HSTS nasazené.
@@ -260,87 +279,120 @@ zatímco riziko zkreslení podle 4.3 je reálné a dokumentované.
 
 **Proto sekce 6 začíná měřením, ne stavbou.**
 
-## 5. Cílová architektura: server-side jako pravda, klient jako doplněk
+## 5. Cílová architektura
+
+Původní návrh v téhle sekci posílal pageviews z `middleware.ts`. **To padlo** — kvůli
+F15 (hlavní web to už jednou zavedl a zrušil pro 16 656 invokací za 24 h) a kvůli 4.3
+bod 1 (prefetch se v middleware spolehlivě odfiltrovat nedá). Obojí je doložené číslo,
+ne názor.
+
+Zůstává tohle rozdělení:
 
 ```
                     ┌─────────────────────────────────────┐
-   návštěvník ──────┤ middleware.ts na webu (server-side) │
-                    │  • pageview                         │  → 100 %, neblokovatelné
-                    │  • payload.ip + payload.userAgent   │
-                    │  • sanitizace URL                   │
+   návštěvník ──────┤ tracker v prohlížeči přes /s/ proxy │
+                    │  • pageview        ← ZŮSTÁVÁ TADY   │  same-origin,
+                    │  • Core Web Vitals                  │  adblock ho neblokuje
+                    │  • screen, device                   │
                     └──────────────┬──────────────────────┘
                                    │  stejné sessionId
                     ┌──────────────┴──────────────────────┐
-                    │ tracker v prohlížeči (obohacení)    │
-                    │  • data-auto-pageview="false"       │  → jen to, co server neví
-                    │  • Core Web Vitals                  │
-                    │  • konverzní události               │
-                    │  • screen                           │
+   backend  ────────┤ serverový handler (Node / Worker)   │
+                    │  • konverze: registrace, platba     │  → neblokovatelné,
+                    │  • payload.ip + payload.userAgent   │    bez prefetch problému
                     └─────────────────────────────────────┘
                                    │
                           /s/api/send → Umami
 ```
 
-**Pravidlo, které se nesmí porušit:** pageview posílá **jen jedna vrstva**.
-Server. Klient má `data-auto-pageview="false"` a pageview neposílá nikdy —
-jinak se všechno počítá dvakrát. Hlavní web tenhle atribut už má.
+**Rozdělení odpovědnosti:**
 
-Když se klientská vrstva zablokuje (adblock, banner), přijdete o CWV a události
-u toho návštěvníka — **ale ne o jeho návštěvu**. To je přesně to, co bylo zadáno.
+| | Kdo posílá | Proč právě on |
+|---|---|---|
+| pageview | **klient** | prefetch a boti by ze serveru nafoukli čísla; proxy `/s/` už adblock řeší |
+| Core Web Vitals, screen | **klient** | server je nemá odkud vzít (4.2) |
+| konverze z backendu | **server** | vzniká při skutečné akci, nezávisí na tom, že uživatel zůstane na stránce |
+| konverze čistě v UI | klient | server o kliknutí neví |
 
-### 5.1 Co musí umět serverová vrstva
+**Pravidlo, které se nesmí porušit:** pageview posílá **jen jedna vrstva**. Dnes klient,
+a to se nemění. Kdyby se někdy přidala serverová, musí se ta klientská ve stejném commitu
+vypnout — jinak se všechno počítá dvakrát.
 
-Implementace je v každém webu vlastní, ale kontrakt je společný:
+Hlavní web má `data-auto-pageview="false"` a pageviews posílá ručně přes `trackUmamiPageview`,
+takže tuhle podmínku splňuje už teď.
+
+### 5.1 Serverové odesílání konverzí — jeden sdílený modul, ne kód per web
+
+Zadání bylo „ať to máme připravené a neřešíme to per web". Runbook dnes říká
+*„`umami.ts` a `trackedHost.ts` se kopírují, ne importují"* — a to je přesně to,
+co se má změnit. Šest webů znamená šest kopií, které se rozejdou.
+
+**Návrh: interní balíček `@vzb/analytics`** (git dependency nebo privátní registry),
+který obsahuje to, co je opravdu společné, a všechno webově specifické bere z konfigurace.
+
+| Vrstva | Obsah | Kde se liší per web |
+|---|---|---|
+| `core/` | fronta, dedupe pageviews, `toTrackedUrl`, `sanitizeBeacon`, `toEventProps` | nijak |
+| `server/` | `sendUmamiEvent()` — odeslání konverze z backendu | nijak |
+| `react/` | `<UmamiAnalytics>` pro App Router i Pages Router | nijak |
+| `config` | `trackedHosts`, `blockedPathPrefixes`, `allowedQueryKeys`, `allowedPropKeys`, `eventNames` | **všechno** |
+
+Konfigurace se předává jednou, při inicializaci — ne přes kopírované konstanty.
+
+**Serverový odesílač, kontrakt:**
 
 ```ts
-// middleware.ts — tvar, ne hotový kód
-export async function middleware(request: NextRequest) {
-  // 1. Vynechat prefetch — jinak se počítají stránky, které nikdo neviděl
-  if (request.headers.get('next-router-prefetch')) return NextResponse.next()
-  if (request.headers.get('sec-purpose')?.includes('prefetch')) return NextResponse.next()
+// @vzb/analytics/server — tvar, ne hotový kód
+export async function sendUmamiEvent({ name, props, request, waitUntil }) {
+  const body = {
+    type: 'event',
+    payload: {
+      website: config.websiteId,
+      hostname: config.primaryHost,
+      url: toTrackedUrl(new URL(request.url).pathname + search),
+      name,
+      data: toEventProps(props),
+      // Bez těchhle dvou spadnou všichni návštěvníci do jedné session
+      ip: clientIpFrom(request),
+      userAgent: request.headers.get('user-agent'),
+    },
+  }
 
-  // 2. Sanitizace URL MUSÍ být i tady — whitelist z lib/analytics/umami.ts
-  //    se na server nedostane sám a tokeny by šly do Umami syrové
-  const url = toTrackedUrl(request.nextUrl)
-  if (!url) return NextResponse.next()
-
-  // 3. Odeslat na pozadí, aby to nepřidávalo latenci odpovědi
-  event.waitUntil(fetch(`${UMAMI_HOST_URL}/api/send`, {
+  const send = fetch(`${config.hostUrl}/api/send`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      type: 'event',
-      payload: {
-        website: WEBSITE_ID,
-        hostname: request.nextUrl.hostname,
-        url,
-        referrer: request.headers.get('referer'),
-        language: request.headers.get('accept-language')?.split(',')[0],
-        // BEZ TĚCHHLE DVOU SE VŠICHNI SLIJÍ DO JEDNÉ SESSION
-        ip: request.headers.get('x-forwarded-for')?.split(',')[0].trim(),
-        userAgent: request.headers.get('user-agent'),
-      },
-    }),
-  }))
+    body: JSON.stringify(body),
+  }).catch(() => {})           // měření nesmí shodit konverzi
 
-  return NextResponse.next()
+  waitUntil ? waitUntil(send) : void send
 }
 ```
 
-Na co si dát pozor:
+**Na co si dát pozor — každý bod stojí na něčem ověřeném:**
 
-- **Sanitizace URL se musí přenést na server.** Dnes žije v `lib/analytics/umami.ts`
-  (`BLOCKED_PATH_PREFIXES`, `ALLOWED_QUERY_KEYS`) a běží v prohlížeči. Middleware ji
-  obejde. **Tohle je jediná změna, kde hrozí únik osobních údajů, když se udělá špatně** —
-  `/online/[token]`, herní PINy, `?email=` v query.
-- **UTM a click ID se musí v `ALLOWED_QUERY_KEYS` udržet** (`utm_*`, `gclid`, `fbclid`,
-  `msclkid`, `sznclid`), jinak přijdete o atribuci kampaní. Umami je parsuje
-  z `url` (`route.ts:210-222`).
-- **`waitUntil`, ne `await`.** Jinak si každou stránku zpomalíte o kolo na Umami.
-- **`x-forwarded-for` se bere první položka zleva** — stejně jako to dělá Umami
-  (`src/lib/ip.ts:63`).
-- **`IGNORE_IP` funguje dál** a správně: blokuje se přeposlaná IP návštěvníka
-  (`route.ts:147`), ne IP vašeho serveru.
+- **IP se nebere z levé strany `x-forwarded-for`.** Umami sice sám bere první položku
+  zleva (`src/lib/ip.ts:63`), ale tu **může klient podvrhnout** a přisvojit si cizí
+  `sessionId`. Hlavní web tuhle lekci má zapsanou v `lib/analytics/clientIp.ts:6-11`:
+  preferuje `x-vercel-forwarded-for` (platformní, nepodvrhnutelná) a z `x-forwarded-for`
+  bere **poslední** položku. `clientIpFrom()` musí dělat totéž.
+  Souvisí s **F14** — na instanci nastavit `CLIENT_IP_HEADER=x-vercel-forwarded-for`.
+- **`BUILD_GEO=1` na instanci je předpoklad.** Bez něj u serverových událostí nevznikne
+  žádná geolokace (a před opravou `57f733070` to bylo rovnou 500). Viz 4.0.
+- **Sanitizace URL platí i tady.** `toTrackedUrl` je whitelist, ne blacklist —
+  `/online/[token]`, `?email=`, herní PINy. To je jediné místo, kde se dá způsobit
+  únik osobních údajů.
+- **UTM a click ID musí v `allowedQueryKeys` zůstat** (`utm_*`, `gclid`, `fbclid`,
+  `msclkid`, `sznclid`), jinak zmizí atribuce kampaní. Umami je parsuje z `url`
+  (`route.ts:210-222`).
+- **Nikdy `await` v cestě odpovědi.** `waitUntil`, nebo fire-and-forget s `.catch()`.
+  Konverze se nesmí rozbít proto, že je Umami pomalé.
+- **`IGNORE_IP` funguje dál a správně:** blokuje se přeposlaná IP návštěvníka
+  (`route.ts:147`), ne IP serveru.
+
+**Co balíček řeší navíc, i bez server-side:** dnes je na hlavním webu čtyřikrát jiný název
+pro dvě hodnoty — `UMAMI_HOST_URL` vs `UMAMI_URL`, `NEXT_PUBLIC_UMAMI_WEBSITE_ID`
+vs `UMAMI_WEBSITE_ID` (digest si čte vlastní dvojici). Balíček tenhle kontrakt sjednotí
+a `.env.example` bude jeden.
 
 ### 5.2 Jak se obě vrstvy „spojí" — a co se nespojí
 
