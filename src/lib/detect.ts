@@ -8,6 +8,7 @@ import { getIpAddress, stripPort } from '@/lib/ip';
 import { safeDecodeURIComponent } from '@/lib/url';
 
 const MAXMIND = 'maxmind';
+const MAXMIND_UNAVAILABLE = 'maxmind_unavailable';
 
 const PROVIDER_HEADERS = [
   // Umami custom headers (cloud mode only)
@@ -110,12 +111,22 @@ export async function getLocation(ip: string = '', headers: Headers, skipHeaders
   }
 
   // Database lookup
-  if (!globalThis[MAXMIND]) {
+  if (!globalThis[MAXMIND] && !globalThis[MAXMIND_UNAVAILABLE]) {
     const dir = path.join(process.cwd(), 'geo');
 
-    globalThis[MAXMIND] = await maxmind.open(
-      process.env.GEOLITE_DB_PATH || path.resolve(dir, 'GeoLite2-City.mmdb'),
-    );
+    try {
+      globalThis[MAXMIND] = await maxmind.open(
+        process.env.GEOLITE_DB_PATH || path.resolve(dir, 'GeoLite2-City.mmdb'),
+      );
+    } catch (e) {
+      // The geo database is optional: build-geo skips the download on Vercel unless
+      // BUILD_GEO is set, and callers that pass payload.ip bypass the provider headers
+      // above and land here. Without this guard the missing file rejects and turns
+      // every such request into a 500. Latch the failure so we don't retry per request.
+      globalThis[MAXMIND_UNAVAILABLE] = true;
+      // eslint-disable-next-line no-console
+      console.warn('Geo database unavailable, location lookup disabled:', e?.message ?? e);
+    }
   }
 
   const result = globalThis[MAXMIND]?.get(cleanIp);

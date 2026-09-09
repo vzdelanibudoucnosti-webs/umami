@@ -5,9 +5,14 @@ import { getIpAddress } from './ip';
 const IP = '127.0.0.1';
 
 const isLocalhost = vi.mocked(await import('is-localhost-ip'));
+const maxmind = vi.mocked(await import('maxmind'));
 
 vi.mock('is-localhost-ip', () => ({
   default: vi.fn(),
+}));
+
+vi.mock('maxmind', () => ({
+  default: { open: vi.fn() },
 }));
 
 beforeEach(() => {
@@ -16,6 +21,10 @@ beforeEach(() => {
   delete process.env.CLIENT_IP_HEADER;
   delete process.env.IGNORE_IP;
   delete process.env.SKIP_LOCATION_HEADERS;
+
+  // The reader and its unavailable flag are cached on globalThis across requests
+  delete globalThis.maxmind;
+  delete globalThis.maxmind_unavailable;
 });
 
 test('getIpAddress: Custom header', () => {
@@ -74,6 +83,37 @@ test('getLocation: treats localhost check errors as non-local', async () => {
     region: 'US-CA',
     city: 'Los Angeles',
   });
+});
+
+test('getLocation: a missing geo database yields no location instead of throwing', async () => {
+  isLocalhost.default.mockResolvedValue(false);
+  maxmind.default.open.mockRejectedValue(new Error('ENOENT: no such file or directory'));
+
+  // skipHeaders is what a server-side caller triggers by passing payload.ip
+  await expect(getLocation('8.8.8.8', new Headers(), true)).resolves.toBeUndefined();
+});
+
+test('getLocation: a missing geo database is only looked up once', async () => {
+  isLocalhost.default.mockResolvedValue(false);
+  maxmind.default.open.mockRejectedValue(new Error('ENOENT: no such file or directory'));
+
+  await getLocation('8.8.8.8', new Headers(), true);
+  await getLocation('8.8.4.4', new Headers(), true);
+
+  expect(maxmind.default.open).toHaveBeenCalledTimes(1);
+});
+
+test('getLocation: provider headers still win over the database', async () => {
+  isLocalhost.default.mockResolvedValue(false);
+
+  await expect(
+    getLocation('8.8.8.8', new Headers({ 'x-vercel-ip-country': 'CZ' }), false),
+  ).resolves.toEqual({
+    country: 'CZ',
+    region: undefined,
+    city: null,
+  });
+  expect(maxmind.default.open).not.toHaveBeenCalled();
 });
 
 test('hasBlockedIp: returns false for malformed client ip with cidr block', () => {
