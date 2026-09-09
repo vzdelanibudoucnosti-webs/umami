@@ -42,3 +42,12 @@ jobs:
       - run: pnpm test
 
       - run: pnpm build
+
+      # The shared analytics package has its own config and is not covered by the
+      # root vitest include pattern, which upstream owns.
+      - name: Test @vzb/analytics
+        working-directory: packages/analytics
+        run: |
+          npx vitest run
+          npx tsc --noEmit
+          npx tsup && npx tsc -p tsconfig.build.json

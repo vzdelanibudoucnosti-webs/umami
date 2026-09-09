@@ -2,6 +2,10 @@ packages:
   - '**'
   - '!dist'
   - '!**/dist/**'
+  # @vzb/analytics is built and consumed on its own, through the analytics-dist branch.
+  # Leaving it out keeps it from becoming a workspace importer, which would invalidate
+  # pnpm-lock.yaml and break `pnpm install --frozen-lockfile`.
+  - '!packages/**'
 allowBuilds:
   '@parcel/watcher': false
   '@prisma/engines': true
