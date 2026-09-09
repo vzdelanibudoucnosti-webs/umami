@@ -99,6 +99,86 @@ describe('sanitizeBeacon', () => {
   });
 });
 
+/**
+ * A site whose funnel runs through addresses that carry a live join code: the page has to
+ * be measured, the code must not be stored. Blocking the path would leave the whole play
+ * flow unmeasured, so it is normalised instead.
+ */
+const gamesConfig: AnalyticsConfig = {
+  ...config,
+  blockedPathPrefixes: ['/api/'],
+  allowedPropKeys: ['game_slug'],
+  allowedNumberPropKeys: ['score', 'rounds'],
+  normalizePath: path => path.replace(/^(\/hry\/[^/]+\/(?:lobby|play|result))\/[^/]+/, '$1/:pin'),
+};
+
+describe('normalizePath', () => {
+  test('collapses the identifying segment but keeps the page and the campaign', () => {
+    expect(toTrackedUrl(gamesConfig, '/hry/cyber-duel/play/AB12?utm_source=meta&pin=AB12')).toBe(
+      '/hry/cyber-duel/play/:pin?utm_source=meta',
+    );
+  });
+
+  test('leaves a path it does not match alone', () => {
+    expect(toTrackedUrl(gamesConfig, '/hry/cyber-duel/solo')).toBe('/hry/cyber-duel/solo');
+  });
+
+  // The blocklist is applied to the normalised path, so a site writes the rule in one
+  // spelling instead of one per raw variant.
+  test('runs before the blocklist', () => {
+    const blocked: AnalyticsConfig = {
+      ...gamesConfig,
+      blockedPathPrefixes: ['/hry/cyber-duel/play/:pin'],
+    };
+
+    expect(toTrackedUrl(blocked, '/hry/cyber-duel/play/AB12')).toBeNull();
+  });
+
+  // The whole reason data-performance needs data-before-send: the beacon's URL is built
+  // by the tracker from window.location and would carry the live PIN.
+  test('reaches the Core Web Vitals beacon as well', () => {
+    expect(
+      sanitizeBeacon(gamesConfig, {
+        url: 'https://hry.example.cz/hry/cyber-duel/play/AB12',
+        referrer: 'https://hry.example.cz/trida/CD-42',
+      }),
+    ).toEqual({ url: '/hry/cyber-duel/play/:pin', referrer: 'https://hry.example.cz' });
+  });
+
+  test('reaches an event, which reads its address off window.location', () => {
+    const analytics = createClientAnalytics(gamesConfig);
+    const track = vi.fn();
+
+    window.history.pushState({}, '', '/hry/cyber-duel/play/AB12');
+    window.umami = { track } as never;
+    analytics.trackEvent('round_finished');
+
+    expect(built(track.mock.calls[0])).toMatchObject({ url: '/hry/cyber-duel/play/:pin' });
+
+    window.umami = undefined;
+    window.history.pushState({}, '', '/');
+  });
+});
+
+describe('allowedNumberPropKeys', () => {
+  test('keeps a whitelisted number as a number, so Umami can report on it', () => {
+    expect(toEventProps(gamesConfig, { score: 7, rounds: 10 } as EventProps)).toEqual({
+      score: 7,
+      rounds: 10,
+    });
+  });
+
+  test('drops a value that is not a finite number', () => {
+    expect(
+      toEventProps(gamesConfig, { score: Number.NaN, rounds: '10' } as unknown as EventProps),
+    ).toEqual({});
+  });
+
+  test('still drops a number whose key is on neither list', () => {
+    expect(toEventProps(gamesConfig, { pin: 1234 } as unknown as EventProps)).toEqual({});
+  });
+});
+
 describe('client', () => {
   let analytics: ReturnType<typeof createClientAnalytics>;
 

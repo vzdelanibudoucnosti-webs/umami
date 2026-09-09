@@ -27,7 +27,10 @@ export function toPathAndQuery(raw: string): string {
  * rather than sending a redacted version of it.
  */
 export function toTrackedUrl(config: AnalyticsConfig, url: string): string | null {
-  const [path, search] = toPathAndQuery(url).split('?');
+  const [rawPath, search] = toPathAndQuery(url).split('?');
+  // Before the blocklist, so a blocked prefix is matched against the normalised path
+  // and a site cannot end up with two spellings of the same rule.
+  const path = config.normalizePath ? config.normalizePath(rawPath) : rawPath;
 
   if (config.blockedPathPrefixes.some(prefix => path.startsWith(prefix))) {
     return null;
@@ -67,7 +70,9 @@ export function toTrackedReferrer(referrer: unknown): string {
 }
 
 /**
- * Whitelist, not blocklist. Revenue is the single exception: Umami fills its revenue
+ * Whitelist, not blocklist, and the two lists are separated by type: a key in
+ * `allowedPropKeys` survives only as a string, one in `allowedNumberPropKeys` only as a
+ * finite number. Revenue is the single exception: Umami fills its revenue
  * table from `revenue` + `currency`, and without them it can only count conversions,
  * not report on them. Because every widening of the whitelist weakens the guard against
  * leaking personal data, the pair is held to hard rules — a finite positive amount in a
@@ -90,6 +95,14 @@ export function toEventProps(config: AnalyticsConfig, props?: EventProps): Sanit
 
     if (typeof value === 'string' && value.trim() !== '') {
       sanitized[key] = value.trim().slice(0, maxLength);
+    }
+  }
+
+  for (const key of config.allowedNumberPropKeys ?? []) {
+    const value = record[key];
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      sanitized[key] = value;
     }
   }
 
