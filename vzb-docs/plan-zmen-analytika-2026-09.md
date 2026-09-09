@@ -264,7 +264,46 @@ Na co si dát pozor:
 - **`IGNORE_IP` funguje dál** a správně: blokuje se přeposlaná IP návštěvníka
   (`route.ts:147`), ne IP vašeho serveru.
 
-### 5.2 `pocitacedetem.cz` je výjimka
+### 5.2 Jak se obě vrstvy „spojí" — a co se nespojí
+
+Nespojují se do jednoho záznamu. Každá událost je **vlastní řádek** v `website_event`
+a pojí je jen společné `session_id` (a `visit_id`). Dashboard je agreguje přes ně.
+
+| Zdroj | `event_type` | Co nese |
+|---|---|---|
+| middleware (server) | `pageView` | url, referrer, UTM, click ID, hostname |
+| tracker (klient) | `performance` | `lcp`, `inp`, `cls`, `fcp`, `ttfb` |
+| tracker (klient) | `customEvent` | `event_name` + `event_data` |
+
+Tohle funguje přesně tak, jak se čeká — session je `uuid(sourceId, ip, userAgent, salt)`,
+takže obě vrstvy trefí stejnou session, aniž by se cokoli páruje.
+
+**Co se ale nespojí: vlastnosti návštěvníka.**
+
+V relačním režimu (což je náš případ — bez ClickHouse) `website_event` **nemá** sloupce
+`browser`, `os`, `device`, `screen`, `language`, `country`. Ty existují **jen na tabulce
+`session`** (`prisma/schema.prisma`, model `Session`) a zapisuje je `createSession`
+příkazem `on conflict (session_id) do nothing`
+(`src/queries/sql/sessions/createSession.ts`).
+
+Tedy: **zapíšou se jednou, prvním requestem, a už nikdy se nepřepíšou.**
+A první je vždycky server — middleware běží na requestu, který teprve vrací HTML,
+dávno předtím, než prohlížeč spustí JS.
+
+Konkrétní důsledky:
+
+| | Dopad |
+|---|---|
+| `screen` | **Zůstane prázdný napořád.** Report rozlišení obrazovky bude prázdný. Klient ho pošle, ale `do nothing` ho zahodí. |
+| `device` | `getDevice()` (`src/lib/detect.ts:48`) bere typ z User-Agentu, takže **mobile / tablet / desktop fungují dál správně**. Ztrácí se jen kategorie `laptop`, která vzniká výhradně z šířky obrazovky ≤ 1920 px. Všechno, co je dnes `laptop`, bude `desktop`. |
+| `browser`, `os` | Z User-Agentu, server ho má → beze změny. |
+| `language` | Z `Accept-Language` → funguje. |
+| `country` / `region` / `city` | Z GeoLite2 místo Vercel hlaviček (viz 4.3 bod 4) → funguje, jiná přesnost. |
+
+Cena hybridu je tedy **report rozlišení obrazovky a kategorie `laptop`**. Nic víc.
+Není to blocker, ale je lepší to vědět předem než se pak divit prázdnému grafu.
+
+### 5.3 `pocitacedetem.cz` je výjimka
 
 WordPress nemá middleware. Varianty, v pořadí preference:
 
@@ -303,7 +342,7 @@ prefetchem" nejde odhadnout od stolu a rozhoduje o tom, jak agresivní filtry na
 | `knihovna.vzdelanibudoucnosti.cz` | P0 — dnes nula dat. Nejdřív zjistit repo a framework. |
 | `code.vzdelanibudoucnosti.cz` | Next.js/Vercel → proxy `/s/` i middleware jdou standardně |
 | `pythongo.cz` | Next.js/Vercel → totéž |
-| `www.pocitacedetem.cz` | WordPress → viz 5.2 |
+| `www.pocitacedetem.cz` | WordPress → viz 5.3 |
 
 Pro každý web projít otázky ze sekce 1 runbooku, zejména **samostatný vs. sdílený
 `websiteId`**, **které cesty a query nesmí ven**, a `data-domains` včetně `www.`
@@ -348,8 +387,9 @@ tabulku pokrytí ze sekce 1 a novou kapitolu o serverové vrstvě podle sekce 5.
 ## 7. Co v tomhle plánu vědomě není
 
 - **Čistě server-side bez klientské vrstvy.** Šlo by to, ale přišli byste o Core Web
-  Vitals, konverzní události a rozlišení `desktop`/`laptop` — viz 4.2. Hybridní model
-  splní zadání („neblokovatelné měření návštěv") a tyhle věci si nechá.
+  Vitals a konverzní události — viz 4.2. Hybridní model splní zadání
+  („neblokovatelné měření návštěv") a tyhle věci si nechá. Report rozlišení obrazovky
+  a kategorii `laptop` ztratíte tak jako tak, i v hybridu — viz 5.2.
 - **ClickHouse.** Při šesti webech téhle velikosti Postgres stačí. Přehodnotit, až
   bude dashboard pomalý — ne preventivně.
 - **Upgrade Umami.** Fork sedí na `v3.3.1` = aktuální upstream `master`.
