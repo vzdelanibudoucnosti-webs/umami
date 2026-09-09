@@ -155,9 +155,23 @@ Ověřeno ve zdrojáku instance, ne odhad:
 
 ### 4.3 Co server-side aktivně zhorší (a je potřeba s tím počítat)
 
-1. **Prefetch.** Next.js `<Link>` si předtahuje RSC payload pro odkazy ve viewportu.
-   To jsou requesty na server pro stránky, které nikdo neviděl. Bez filtru na
-   `Next-Router-Prefetch` / `Sec-Purpose: prefetch` vám pageviews **nafouknou**.
+1. **Prefetch — a filtr na něj v middleware spolehlivě nefunguje.**
+   Next.js `<Link>` si v produkci předtahuje RSC payload pro **každý odkaz, který se
+   objeví ve viewportu**. To jsou requesty na server pro stránky, které nikdo neviděl.
+
+   Obvyklá rada je odfiltrovat je hlavičkou `next-router-prefetch` / `purpose: prefetch`
+   (i přes `matcher.missing` v konfiguraci middleware). **Jenže ta hlavička v middleware
+   spolehlivě není** — jsou na to otevřené issues
+   [#85836](https://github.com/vercel/next.js/issues/85836) a
+   [#63728](https://github.com/vercel/next.js/issues/63728), plus
+   [diskuze #37736](https://github.com/vercel/next.js/discussions/37736).
+
+   Next.js sám v dokumentaci k prefetchi říká, že se analytika **nemá** volat při renderu,
+   a doporučuje ji přesunout do `useEffect` — tedy na klienta
+   ([Guides: Prefetching → Triggering unwanted side-effects](https://nextjs.org/docs/app/guides/prefetching)).
+
+   **Tohle je přímo proti zadání „nezkreslená data".** Nafouknutí není odhad, je to
+   dokumentovaný a dosud nevyřešený problém.
 2. **Boti.** Klientsky se bot bez JS nikdy nezapočítal. Server-side dorazí každý crawler.
    `isbot(userAgent)` (`route.ts:142`) odchytí ty poctivé; zbytek skončí ve vašich číslech.
 3. **Objem zápisů do DB.** Bez `x-umami-cache` tokenu běží `createSession` na každém
@@ -181,6 +195,35 @@ session** — do té, která patří vašemu serveru. To je nejčastější způ
 server-side tracking rozbít, a v datech se to pozná až po týdnu.
 
 ---
+
+### 4.5 Jak to řeší ostatní (a vybočujeme?)
+
+Krátká odpověď: **nevybočujeme, hybrid je mainstream.** Ale „server-side" znamená
+v praxi něco jiného, než se běžně čeká.
+
+- **Plausible** má Events API pro server-side a jeho kontrakt je **identický s Umami**:
+  musíte poslat `X-Forwarded-For` s reálnou IP návštěvníka a správný `User-Agent`,
+  jinak se počítání unikátních návštěvníků rozbije. Jejich dokumentace přímo varuje,
+  že když proxy pošle vlastní IP místo návštěvníkovy, **bot filtr událost zahodí**.
+  Přesně ta past, která je popsaná v 4.4.
+- **Server-side GTM (sGTM), Stape, Piwik PRO** — tady je nejčastější omyl v celé
+  branži: **sGTM nenahrazuje klientský sběr.** V každém produkčním nasazení pořád běží
+  webový kontejner v prohlížeči a posílá data na váš tagovací server. Server-side se
+  přesouvá *přeposílání a obohacení*, ne *sběr*. Kdo čeká, že mu sGTM obejde adblock
+  na straně sběru, nasadí něco jiného, než si myslí.
+- **Segment / RudderStack / PostHog** — kanonický model je přesně ten hybridní:
+  server-side pro události, které vznikají na backendu (platba, registrace, objednávka),
+  klient pro to, co se děje v UI. Nikdo z nich nedoporučuje měřit pageviews ze serveru.
+- **Log-based analytika** (AWStats, GoAccess) je „100 % server-side" ve své nejčistší
+  podobě — a je dávno opuštěná právě proto, že napočítá boty, prefetch a cache.
+
+Z toho plyne jedna nepříjemná, ale důležitá věc: **first-party proxy `/s/`, kterou už
+máte, je ta hlavní obrana proti adblocku** — a máte ji nasazenou. Skript i beacon jsou
+same-origin, na filtračních listech nejsou. Marginální zisk z middleware vrstvy je proti
+tomu malý (návštěvníci s vypnutým JS, odchod před hydratací, banner blokující načtení),
+zatímco riziko zkreslení podle 4.3 je reálné a dokumentované.
+
+**Proto sekce 6 začíná měřením, ne stavbou.**
 
 ## 5. Cílová architektura: server-side jako pravda, klient jako doplněk
 
@@ -316,21 +359,54 @@ WordPress nemá middleware. Varianty, v pořadí preference:
 
 ## 6. Plán změn
 
-### Krok 1 — pilot server-side na jednom webu *(dělat první, samostatně)*
+### Krok 1 — nejdřív změřit, kolik vám adblock reálně bere *(týden, skoro žádná práce)*
 
-**Kandidát: `hry.vzdelanibudoucnosti.cz`.** Je to jediný web, který má Umami a zároveň
-**žádnou jinou analytiku** — takže je na něm vidět čistý rozdíl a nic se nerozbije.
-Next.js App Router, tedy stejný tvar jako většina portfolia.
+Server-side vrstva je řešení problému, jehož velikost zatím nikdo nezná. Než se
+postaví něco, co podle 4.3 může data zkreslit, je potřeba vědět, jestli se to vyplatí.
 
-1. Přidat `middleware.ts` podle 5.1, klientský tracker nechat běžet **beze změny**.
-2. Nechat běžet **48 hodin s oběma vrstvami** a porovnat:
-   - kolik pageviews přibylo (= kolik vám dnes bere adblock),
-   - kolik z toho je prefetch a boti (= o kolik je to nafouknuté),
-   - sedí `sessionId` napříč vrstvami? (ověření sekce 4.4)
-3. Teprve podle těch čísel vypnout klientský pageview.
+**Měření na `vzdelanibudoucnosti.cz`** (má nejvíc provozu i nejvíc paralelních měření):
 
-Bez tohohle kroku se plán dělá naslepo. Poměr „ušlé kvůli adblocku" ku „nafouknuté
-prefetchem" nejde odhadnout od stolu a rozhoduje o tom, jak agresivní filtry nastavit.
+1. Za stejné období vzít **počet pageviews z Umami** a **počet requestů na tytéž cesty
+   z Vercel logů** (případně z Cloudflare u `pocitacedetem.cz`).
+2. Z Vercel čísel odečíst boty, prefetch a `/_next/*`.
+3. Rozdíl = **kolik měření vám dnes uniká** i s nasazenou `/s/` proxy.
+
+Rozhodovací pravidlo, dohodnuté předem, ať se pak nediskutuje nad výsledkem:
+
+| Rozdíl | Závěr |
+|---|---|
+| **do ~5 %** | Proxy stačí. Server-side pageviews **nestavět** — přineslo by to víc šumu než dat. Krok 6 (konverze) udělat stejně. |
+| **5–20 %** | Postavit hybrid podle sekce 5, ale jen na Next.js webech a s pilotem podle 1b. |
+| **nad 20 %** | Server-side má jasnou hodnotu, jít do toho včetně `pocitacedetem.cz` (5.3). |
+
+**1b — pilot, jen pokud rozdíl vyjde nad 5 %.** Kandidát `hry.vzdelanibudoucnosti.cz`:
+jediný web s Umami a **žádnou jinou analytikou**, takže je na něm vidět čistý rozdíl.
+Middleware podle 5.1, klientský tracker běží **beze změny**, 48 hodin, pak porovnat:
+
+- kolik pageviews přibylo (= reálný zisk),
+- **kolik z toho je prefetch** — a jestli se vůbec dá odfiltrovat (viz 4.3 bod 1;
+  tohle je test, který rozhodne, jestli je middleware varianta použitelná),
+- sedí `sessionId` napříč vrstvami? (ověření 4.4)
+
+Teprve podle těch čísel vypnout klientský pageview.
+
+### Krok 6 — server-side konverze *(hodnota nezávislá na výsledku kroku 1)*
+
+Tohle dělat **bez ohledu na to, jak dopadne měření**, protože je to ta část server-side
+trackingu, kde je hodnota jednoznačná a žádné riziko zkreslení nehrozí.
+
+Události, které vznikají na **backendu** — odeslaná registrace, potvrzená platba,
+dokončená objednávka — posílat do Umami přímo ze serverového handleru:
+
+- Nikdo je nezablokuje a nezáleží na souhlasu s marketingovými cookies.
+- Nemají problém s prefetchem — vznikají jen při skutečné akci.
+- Handler má k dispozici IP i User-Agent původního requestu, takže se podle 4.4
+  napojí na správnou session návštěvníka.
+- Je to přesně model, který doporučují Segment i PostHog (viz 4.5).
+
+Prakticky: `trackUmamiEvent('registrace_dokoncena', …)` dnes běží v prohlížeči a spolehne
+se na to, že uživatel po odeslání zůstane na stránce. Serverová varianta tuhle ztrátu
+odstraní — a konverze jsou to jediné číslo, u kterého se ztráta 5 % opravdu pozná.
 
 ### Krok 2 — dorovnat pokrytí *(P0, nezávislé na kroku 1)*
 
@@ -401,9 +477,10 @@ tabulku pokrytí ze sekce 1 a novou kapitolu o serverové vrstvě podle sekce 5.
 ## 8. Doporučené pořadí
 
 ```
-Krok 1 (pilot na hry.*)  ──►  data, podle kterých se rozhodne zbytek
-Krok 2 (dorovnat pokrytí)  ← nezávislé, dá se dělat souběžně
-Krok 3 (úklid)             ← po kroku 1
+Krok 1 (změřit ztrátu)     ──►  rozhodne, jestli se Krok 1b vůbec dělá
+Krok 2 (dorovnat pokrytí)  ← nezávislé, dá se začít hned
+Krok 6 (server-side konverze) ← nezávislé na výsledku měření, dělat tak jako tak
+Krok 3 (úklid)             ← po rozhodnutí z kroku 1
 Krok 4 (hygiena)           ← nezávislé; 4.1 je na 10 minut
 Krok 5 (runbook)           ← průběžně
 ```
@@ -412,8 +489,25 @@ Krok 5 (runbook)           ← průběžně
 opravit runbook (F8) — dohromady pod hodinu.
 
 **Největší hodnota:** Krok 2, protože o čtyřech ze šesti webů dnes nevíte nic.
+Žádná architektura měření to nenahradí.
 
-**Nejrizikovější místo celého plánu:** sanitizace URL v serverové vrstvě (5.1).
+**Co nedělat:** nestavět server-side pageviews dřív, než bude hotový Krok 1. Podle 4.5
+je `/s/` proxy, kterou už máte, hlavní obrana proti adblocku — a podle 4.3 může
+middleware vrstva data spíš zkreslit než zpřesnit, dokud se neprokáže, že prefetch
+jde odfiltrovat.
+
+**Nejrizikovější místo, pokud se server-side stavět bude:** sanitizace URL (5.1).
 Dnešní whitelist běží v prohlížeči a middleware ho obejde. Když se přenese špatně,
-poletí do Umami tokeny, PINy a e-maily z adres. To je jediná část, která si zaslouží
-ruční test na každém webu zvlášť.
+poletí do Umami tokeny, PINy a e-maily z adres. Jediná část, která si zaslouží ruční
+test na každém webu zvlášť.
+
+---
+
+## 9. Zdroje k sekci 4.5
+
+- [Plausible — Events API](https://plausible.io/docs/events-api) (požadavky na `X-Forwarded-For` a `User-Agent`)
+- [Analytics Mania — Introduction to GTM Server-Side Tagging](https://www.analyticsmania.com/post/introduction-to-google-tag-manager-server-side-tagging/)
+- [Piwik PRO — Server-side tracking and server-side tagging](https://piwik.pro/blog/server-side-tracking-first-party-collector/)
+- [Stape — Client-Side vs Server-Side Tracking](https://stape.io/blog/server-side-tagging-versus-client-side-tagging)
+- [Next.js — Guides: Prefetching](https://nextjs.org/docs/app/guides/prefetching) (analytika patří do `useEffect`, ne do renderu)
+- [vercel/next.js#85836](https://github.com/vercel/next.js/issues/85836), [#63728](https://github.com/vercel/next.js/issues/63728), [diskuze #37736](https://github.com/vercel/next.js/discussions/37736) — chybějící prefetch hlavičky v middleware
