@@ -2,7 +2,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createClientAnalytics } from './client';
 import { sanitizeBeacon, toEventProps, toTrackedReferrer, toTrackedUrl } from './sanitize';
 import { createServerAnalytics } from './server';
-import type { AnalyticsConfig } from './types';
+import type { AnalyticsConfig, EventProps } from './types';
+
+/**
+ * What a site declares for its own events: an ordinary interface extending EventProps.
+ * That it assigns cleanly is the point — EventProps deliberately has no index signature,
+ * because TypeScript would then reject exactly this shape.
+ */
+interface SiteProps extends EventProps {
+  course_slug?: string;
+  school?: string;
+}
 
 const config: AnalyticsConfig = {
   websiteId: '01b034e5-4269-4f10-86fc-4b747c710c0d',
@@ -41,7 +51,7 @@ describe('toTrackedUrl', () => {
 
 describe('toEventProps', () => {
   test('keeps only whitelisted keys, so no personal data reaches Umami', () => {
-    expect(toEventProps(config, { course_slug: 'python', email: 'a@b.cz' })).toEqual({
+    expect(toEventProps(config, { course_slug: 'python', email: 'a@b.cz' } as SiteProps)).toEqual({
       course_slug: 'python',
     });
   });
@@ -99,7 +109,7 @@ describe('client', () => {
   });
 
   test('holds an event fired before the tracker loaded and sends it once it does', () => {
-    analytics.trackEvent('registration_submit', { course_slug: 'python' });
+    analytics.trackEvent('registration_submit', { course_slug: 'python' } as SiteProps);
 
     const track = vi.fn();
     window.umami = { track } as never;
@@ -113,7 +123,7 @@ describe('client', () => {
 
   test('keeps the order in which early items were created', () => {
     analytics.trackPageview('/kurzy');
-    analytics.trackEvent('registration_submit', { course_slug: 'a' });
+    analytics.trackEvent('registration_submit', { course_slug: 'a' } as SiteProps);
 
     const track = vi.fn();
     window.umami = { track } as never;
@@ -135,7 +145,7 @@ describe('client', () => {
 
   test('stops queueing so a page cannot grow the queue forever', () => {
     for (let i = 0; i < 50; i += 1) {
-      analytics.trackEvent('e', { course_slug: `c${i}` });
+      analytics.trackEvent('e', { course_slug: `c${i}` } as SiteProps);
     }
 
     const track = vi.fn();
@@ -147,7 +157,7 @@ describe('client', () => {
 
   test('keeps the url from when the item was created, not from when the queue drained', () => {
     window.history.pushState({}, '', '/registrace/python?utm_source=cta');
-    analytics.trackEvent('registration_submit', { course_slug: 'python' });
+    analytics.trackEvent('registration_submit', { course_slug: 'python' } as SiteProps);
 
     window.history.pushState({}, '', '/dekujeme');
     const track = vi.fn();
@@ -313,7 +323,7 @@ describe('server', () => {
   });
 
   test('posts the event with the visitor ip and user agent', async () => {
-    await server.sendEvent({ ...input, props: { course_slug: 'python' } });
+    await server.sendEvent({ ...input, props: { course_slug: 'python' } as SiteProps });
 
     expect(fetchMock).toHaveBeenCalledWith(`${HOST}/api/send`, expect.objectContaining({ method: 'POST' }));
     expect(sentBody()).toMatchObject({

@@ -33,12 +33,17 @@ export interface AnalyticsConfig {
   maxQueuedItems?: number;
 }
 
+/**
+ * Deliberately has no index signature. TypeScript does not give interfaces an implicit
+ * one, so requiring it here would reject every ordinary `interface` a site declares for
+ * its own events — which is exactly what callers pass. Arbitrary keys are read through a
+ * cast inside toEventProps instead, and the whitelist decides what survives anyway.
+ */
 export interface EventProps {
   /** Amount in the currency below. Sent only together with `currency`. */
   revenue?: number;
   /** ISO 4217 code. Umami ignores revenue without it. */
   currency?: string;
-  [key: string]: unknown;
 }
 
 export type SanitizedProps = Record<string, string | number>;

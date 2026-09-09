@@ -83,9 +83,10 @@ export function toEventProps(config: AnalyticsConfig, props?: EventProps): Sanit
   }
 
   const maxLength = config.maxPropLength ?? DEFAULT_MAX_PROP_LENGTH;
+  const record = props as Record<string, unknown>;
 
   for (const key of config.allowedPropKeys) {
-    const value = props[key];
+    const value = record[key];
 
     if (typeof value === 'string' && value.trim() !== '') {
       sanitized[key] = value.trim().slice(0, maxLength);
