@@ -106,12 +106,16 @@ nastavit `BUILD_GEO=1`.
 
 **F14 — `IGNORE_IP` jde obejít jednou hlavičkou.** `true-client-ip` je první
 v `IP_ADDRESS_HEADERS` (`src/lib/ip.ts:5`) a Vercel ji nenastavuje ani nestriptuje,
-takže hodnota od volajícího vyhraje. Změřeno: request, který bez hlavičky vrací **403**,
-s `true-client-ip: 8.8.8.8` vrací **200**. Protože je `/api/send` bez autentizace
+takže hodnota od volajícího vyhraje. Změřeno oběma cestami — request, který bez hlavičky
+vrací **403**, vrací s `true-client-ip: 8.8.8.8` **200**, a to jak přímo na instanci,
+tak **přes veřejnou proxy `/s/` měřeného webu**. Protože je `/api/send` bez autentizace
 a `websiteId` je veřejné, může kdokoli zapisovat události pod libovolnou IP, lokalitou
-a session. `x-forwarded-for` ani `x-vercel-forwarded-for` podvrhnout nejdou — Vercel
-je přepisuje. **Oprava je konfigurační:** `CLIENT_IP_HEADER=x-vercel-forwarded-for`.
-Detaily a měření v `vzb-docs/umami-instance-config.md`.
+a session. `x-forwarded-for`, `x-vercel-forwarded-for` ani `x-real-ip` podvrhnout nejdou —
+Vercel je přepisuje.
+**Oprava je konfigurační: `CLIENT_IP_HEADER=x-real-ip`.**
+⚠️ **Ne `x-vercel-forwarded-for`** — na deploymentu Umami je to IP měřeného webu, ne
+návštěvníka, takže by se všichni slili do jedné session. Plná matice měření
+v `vzb-docs/umami-instance-config.md`.
 
 **F15 — middleware tracking už jednou zaveden byl a byl zrušen.**
 `lib/analytics/pxClient.ts:3-5` na hlavním webu: dřívější širší middleware způsobil
@@ -279,6 +283,54 @@ zatímco riziko zkreslení podle 4.3 je reálné a dokumentované.
 
 **Proto sekce 6 začíná měřením, ne stavbou.**
 
+### 4.6 Boti a falešné pageviews — co k nám reálně dojde
+
+Veřejná čísla o botech (Cloudflare Radar 06/2026: 57,5 % HTML requestů; Imperva
+*Bad Bot Report 2026*: 53,3 % automatizovaného provozu) popisují **edge logy, ne dashboard
+Umami**. Protože měříme klientským beaconem, většina botů se k `/api/send` vůbec nedostane
+— GPTBot, ClaudeBot, PerplexityBot ani náhledoví boti Slacku a WhatsAppu **nespouštějí JS**.
+
+Z toho plyne obrácené pořadí priorit, než se čeká:
+
+**1. Prerender byl reálný problém — a je opravený.** ✅ `b1bd87c9b`
+Prerenderovaná stránka spustí skripty a dojde do `readyState: 'complete'`, takže tracker
+odeslal pageview pro stránku, kterou nikdo neotevřel. **Nepotřebuje to souhlas webu** —
+Chrome prerenderuje z adresního řádku sám a ověřeno, že žádný z našich webů `speculationrules`
+neemituje, takže všechny falešné pageviews pocházely z predikce prohlížeče.
+Nešlo to odfiltrovat na serveru: `Sec-Purpose` je na requestu dokumentu, ne na beaconu.
+Tracker teď čeká na `prerenderingchange`.
+
+*Next.js `<Link>` prefetch tenhle problém nemá* — stahuje RSC payload a skripty stránky
+nespouští. Prerender je jiný mechanismus.
+
+**2. Přeposílá proxy `/s/` správnou IP? — ANO, ověřeno.**
+Byla to oprávněná obava: `next.config.js` rewrite je serverová proxy, takže by Umami mohlo
+vidět IP originu místo návštěvníka — což by tiše rozbilo `IGNORE_IP`, hashování session
+i geolokaci. **Měření to vyvrací:** beacon z prohlížeče na `vzdelanibudoucnosti.cz`
+i `hry.*` vrací **403**, a `forbidden()` je v `route.ts:147` jediné místo, které 403 vrací —
+tedy `hasBlockedIp()` moji domácí IP korektně poznalo. Proxy IP přeposílá správně.
+
+**3. Monitoring je reálnější zdroj šumu než crawleři.**
+Prosté HTTP kontroly se k beaconu nedostanou, ale **browser checks Checkly, Better Stack
+Playwright a Pingdom transaction checks JS spouštějí — a posílají obyčejný Chrome
+User-Agent bez bot tokenu**, takže je `isbot` nechytí. Pokud takový monitoring na weby
+nasadíme, jejich IP patří do `IGNORE_IP` (published listy:
+`betteruptime.com/ips.txt`, `api.uptimerobot.com/meta/ips`, fixní sada Checkly).
+
+**4. `isbot` nechávat na `^5.2.1`.** Verze 5.2.0 měla regresi, která označovala
+in-app prohlížeč Facebooku za bota ([isbot#314](https://github.com/omrilotan/isbot/issues/314)) —
+downgrade pod 5.2.1 by tiše zahazoval skutečné návštěvy. Do budoucna pozor: v6 má zrušit
+staré názvy exportů a Umami importuje legacy `{ isbot }` (`route.ts:2`, `record/route.ts:1`).
+
+**5. Crawler IP listy pro `/api/send` nemá smysl řešit** — crawleři JS nespouštějí, takže
+nedorazí. Relevantní jsou jen pro serverovou vrstvu `/api/px` na hlavním webu, která je
+zapisuje. Tam už bot filtr existuje a vznikl z tvrdé zkušenosti: předchozí tabulka
+`public.pageview` měla 1,59 M řádků, z toho ~97 % botů.
+
+**Co jsme neověřili:** jestli je `x-vercel-ja4-digest` dostupný aplikačnímu kódu
+(zdroje Vercelu si odporují). Na závěru to nic nemění — první-party bot klasifikace
+od Vercelu v hlavičkách není.
+
 ## 5. Cílová architektura
 
 Původní návrh v téhle sekci posílal pageviews z `middleware.ts`. **To padlo** — kvůli
@@ -374,8 +426,11 @@ export async function sendUmamiEvent({ name, props, request, waitUntil }) {
   zleva (`src/lib/ip.ts:63`), ale tu **může klient podvrhnout** a přisvojit si cizí
   `sessionId`. Hlavní web tuhle lekci má zapsanou v `lib/analytics/clientIp.ts:6-11`:
   preferuje `x-vercel-forwarded-for` (platformní, nepodvrhnutelná) a z `x-forwarded-for`
-  bere **poslední** položku. `clientIpFrom()` musí dělat totéž.
-  Souvisí s **F14** — na instanci nastavit `CLIENT_IP_HEADER=x-vercel-forwarded-for`.
+  bere **poslední** položku. `clientIpFrom()` musí dělat totéž. Pozor na kontext:
+  na deploymentu *měřeného webu* je `x-vercel-forwarded-for` IP návštěvníka a je správná;
+  na deploymentu *Umami* je to IP toho webu — proto se na instanci nastavuje
+  `CLIENT_IP_HEADER=x-real-ip`, ne tahle hlavička.
+  Souvisí s **F14** — na instanci nastavit `CLIENT_IP_HEADER=x-real-ip`.
 - **`BUILD_GEO=1` na instanci je předpoklad.** Bez něj u serverových událostí nevznikne
   žádná geolokace (a před opravou `57f733070` to bylo rovnou 500). Viz 4.0.
 - **Sanitizace URL platí i tady.** `toTrackedUrl` je whitelist, ne blacklist —
@@ -437,10 +492,27 @@ Není to blocker, ale je lepší to vědět předem než se pak divit prázdném
 
 WordPress nemá middleware. Varianty, v pořadí preference:
 
-1. **Cloudflare Worker** před webem (Cloudflare tam už je — běží Cloudflare Insights).
-   Dělá totéž co middleware a řeší i proxy `/s/`.
-2. **PHP mu-plugin** volající `/api/send` na `template_redirect`, neblokujícím requestem.
-3. **Klientský tracker** jako dnes ostatní weby — s vědomím, že část měření sebere adblock.
+1. **Klientský tracker přes proxy** jako ostatní weby. Proxy `/s/` se na WordPressu udělá
+   v `.htaccess`/Nginx nebo Cloudflare Workerem (Cloudflare tam už je — běží Cloudflare
+   Insights). Pokrývá pageviews i Core Web Vitals.
+2. **Vlastní PHP mu-plugin** volající `/api/send` na `template_redirect` neblokujícím
+   requestem — jen pro serverové konverze, ne pro pageviews.
+3. **Cloudflare Worker** dělající totéž na hraně.
+
+> ⚠️ **Nepoužívat plugin `umami-wp-connect` ani jeho forky.**
+> Oficiální stránka integrací Umami ho doporučuje, ale odkaz je mrtvý a **celý GitHub účet
+> `ceviixx` je smazaný** — ověřeno nezávisle 2026-09-09: `github.com/ceviixx` → **404**,
+> `github.com/ceviixx/umami-wp-connect` → **404**, kontrolní `github.com/mikecao` → 200.
+>
+> Plugin má natvrdo `define('UMAMI_CONNECT_GITHUB_USER', 'ceviixx')` a jeho self-updater
+> z toho účtu **stahuje a instaluje release ZIPy**. Ten username je dnes volný
+> k registraci, takže kdokoli si ho zaregistruje může doručit libovolné PHP do všech
+> existujících instalací. Forky (`First8Marketing/first8marketing-track`) tuhle konstantu
+> dědí.
+>
+> Druhý oficiálně doporučovaný plugin (`integrate-umami` na wordpress.org) žije, ale umí
+> **jen klientské měření** — na serverové konverze se nedá použít. Varianta 2 se proto
+> píše od nuly, ne forkem.
 
 ---
 
@@ -456,7 +528,7 @@ Kroky jsou v pořadí, v jakém se mají dělat. Krok 0 je hotový v tomhle repu
 | CI na forku (F9) | ✅ `.github/workflows/ci-fork.yml` |
 | Konfigurační runbook (F10) | ✅ `vzb-docs/umami-instance-config.md` |
 | **`BUILD_GEO=1`** ve Vercel env `vzb-umami` | ⬜ nutné, jakmile se začne posílat `payload.ip` |
-| **`CLIENT_IP_HEADER=x-vercel-forwarded-for`** (F14) | ⬜ zavře obcházení `IGNORE_IP`, udělat hned |
+| **`CLIENT_IP_HEADER=x-real-ip`** (F14) | ⬜ zavře obcházení `IGNORE_IP`, udělat hned |
 
 Obě proměnné jsou změna v dashboardu, ne v kódu. `CLIENT_IP_HEADER` nemá na nic
 negativní dopad a řeší bezpečnostní díru — nemá smysl s ním čekat.
@@ -580,7 +652,7 @@ Krok 0 (instance)   ✅ hotovo v repu; zbývají 2 env proměnné — 10 minut
    └─ Krok 6 (runbook)          ← průběžně
 ```
 
-**Udělat hned (pod hodinu):** `CLIENT_IP_HEADER=x-vercel-forwarded-for` (zavře F14),
+**Udělat hned (pod hodinu):** `CLIENT_IP_HEADER=x-real-ip` (zavře F14),
 smazat mrtvý UA z `pythongo.cz` (F4), opravit runbook (F8).
 
 **Největší hodnota:** Krok 2. O čtyřech ze šesti webů dnes nevíte nic a žádná

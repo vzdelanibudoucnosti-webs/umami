@@ -39,32 +39,75 @@ Ověřeno: `/stats.js` i `/script.js` vrací 200, 4733 B, `cache-control: public
 | Proměnná | Poznámka |
 |---|---|
 | `IGNORE_IP` | Seznam IP nebo CIDR oddělený čárkami. Čte `hasBlockedIp` (`src/lib/detect.ts`), odmítá události na `/api/send` s **403**. |
-| `CLIENT_IP_HEADER` | **Nastavit na `x-vercel-forwarded-for`.** Viz níže — bez toho jde `IGNORE_IP` obejít. |
+| `CLIENT_IP_HEADER` | **Nastavit na `x-real-ip`.** Viz níže — bez toho jde `IGNORE_IP` obejít. |
 
-### `CLIENT_IP_HEADER=x-vercel-forwarded-for` — ověřená mitigace
+### `CLIENT_IP_HEADER=x-real-ip` — ověřená mitigace
 
 `src/lib/ip.ts:5` má seznam `IP_ADDRESS_HEADERS` a **`true-client-ip` je v něm první**.
 Vercel tuhle hlavičku nenastavuje ani nestriptuje, takže hodnota od volajícího vyhraje.
 Endpoint `/api/send` je přitom `skipAuth: true` a `websiteId` je veřejné (je v HTML).
 
-Změřeno 2026-09-09, nemutující sonda (`type:"identify"` bez `id` i `data` nic nezapisuje):
+Změřeno 2026-09-09 nemutující sondou (`type:"identify"` bez `id` i `data` nic nezapisuje),
+oběma cestami — přímo na instanci i přes proxy `/s/` na hlavním webu:
 
-| Request | Výsledek |
-|---|---|
-| bez hlavičky | **403** — moje IP je v `IGNORE_IP`, čekaný stav |
-| `x-forwarded-for: 8.8.8.8` | **403** — Vercel hlavičku přepisuje, podvrhnout nejde |
-| `x-vercel-forwarded-for: 8.8.8.8` | **403** — Vercel ji přepisuje taky |
-| **`true-client-ip: 8.8.8.8`** | **200** — **blokace obejita** |
+| Hlavička v requestu | Přímo na Umami | Přes `/s/` proxy |
+|---|---|---|
+| *(žádná)* | 403 | 403 |
+| `x-forwarded-for: 8.8.8.8` | 403 | — |
+| `x-vercel-forwarded-for: 8.8.8.8` | 403 | — |
+| `x-real-ip: 8.8.8.8` | 403 | 403 |
+| **`true-client-ip: 8.8.8.8`** | **200** | **200** |
 
-Dopad: kdokoli může obejít `IGNORE_IP` a zároveň si vybrat, pod jakou IP (a tedy pod jakou
-session a lokalitou) se událost zapíše.
+`403` znamená, že Umami správně poznalo moji (blokovanou) IP. `200` znamená, že hodnota
+z hlavičky přebila zjištění IP.
 
-Oprava je čistě konfigurační: `getIpAddress` (`src/lib/ip.ts:76-80`) při nastaveném
-`CLIENT_IP_HEADER` čte **jen** tuhle hlavičku. Když se nastaví na `x-vercel-forwarded-for`,
-kterou Vercel vždy přepisuje, seznam se přeskočí a `true-client-ip` přestane hrát roli.
+**Závěr: `true-client-ip` je jediný podvrhnutelný nosič — a funguje i přes veřejnou
+proxy měřeného webu.** Kdokoli může obejít `IGNORE_IP` a vybrat si, pod jakou IP,
+lokalitou a session se událost zapíše.
+
+Oprava: `getIpAddress` (`src/lib/ip.ts:76-80`) při nastaveném `CLIENT_IP_HEADER` čte
+**jen** tuhle hlavičku a seznam přeskočí. Správná hodnota je **`x-real-ip`**:
+
+- **Není podvrhnutelná** — Vercel ji přepisuje (ověřeno oběma cestami, obojí 403).
+- **Přežije proxy `/s/`** a nese IP návštěvníka, ne originu. To je klíčové a není to
+  samozřejmé — viz níže.
+
+> ⚠️ **`x-vercel-forwarded-for` použít NELZE**, i když se to nabízí jako „platformní,
+> tedy nejbezpečnější". Na deploymentu Umami je to IP **měřeného webu**, ne návštěvníka,
+> takže by se **všichni návštěvníci slili do jedné session**. Tahle varianta byla
+> v dřívější verzi tohoto dokumentu doporučena omylem.
 
 **Neruší to serverové odesílání událostí** — `payload.ip` má přednost před `getIpAddress`
-úplně (`src/lib/detect.ts:131`), takže server-side vrstva funguje dál.
+úplně (`src/lib/detect.ts:131`).
+
+**Zbytkové riziko:** `getIpAddress` použije vlastní hlavičku jen když je přítomná
+(`ip.ts:78`); jinak propadne na původní seznam. Na Vercelu je `x-real-ip` nastavená vždy,
+takže se to v praxi nestane — ale ta cesta v kódu existuje.
+
+**Po nastavení ověřit:** `true-client-ip: 8.8.8.8` má nově vracet **403**, a request
+bez hlaviček musí vracet **403** dál (kdyby vrátil 200, mitigace rozbila rozpoznání IP
+a je potřeba ji okamžitě vrátit).
+
+### Jak se IP dostane přes proxy `/s/` — a proč to je jinak, než říká dokumentace
+
+Vercel dokumentuje, že `x-forwarded-for` i `x-real-ip` **přepisuje** a externí IP
+nepředává. Z toho by plynulo, že přes rewrite `/s/api/send → <umami>/api/send` uvidí Umami
+IP originu hlavního webu a všechny klientské session se slijí do jedné.
+
+**Měření to vyvrací.** Beacon přes proxy vrací `403` s tělem
+`{"error":{"message":"Forbidden","code":"forbidden","status":403}}` — což je formát
+odpovědi Umami a `forbidden()` je v `src/app/api/send/route.ts:147` **jediné** místo,
+které ho vrací. Umami tedy moji skutečnou IP vidí.
+
+Vysvětlení: Next.js rewrite předává hlavičky příchozího requestu dál **beze změny**
+(ověřeno tím, že přes proxy prošel i podvržený `true-client-ip`), a Vercel na cílovém
+deploymentu je nepřepisuje. Umami tak čte hlavičky, které nastavil edge **hlavního webu**
+— tedy s IP návštěvníka.
+
+Praktický důsledek: **věrohodná geografie v dashboardu není důkaz, že přeposílání IP
+funguje.** `getLocation` se vrací na první provider hlavičce (`cf-ipcountry`
+před `x-vercel-ip-country`, `src/lib/detect.ts:24-33`) nezávisle na tom, jakou IP se
+hashuje session. Kontrolní metrika je **poměr sessions k pageviews**, ne mapa.
 
 ---
 
