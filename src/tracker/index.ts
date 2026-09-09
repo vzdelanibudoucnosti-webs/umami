@@ -644,11 +644,26 @@ type MetricEntry = PerformanceEntry & {
   let identity: string | undefined;
   let flushPerformance: (() => void) | undefined;
 
-  if (autoTrack && !trackingDisabled()) {
+  const bootstrap = () => {
     if (document.readyState === 'complete') {
       init();
     } else {
       document.addEventListener('readystatechange', init, true);
+    }
+  };
+
+  if (autoTrack && !trackingDisabled()) {
+    // A prerendered page runs its scripts and reaches readyState 'complete' even
+    // though the visitor may never open it, and Chrome prerenders from the omnibox
+    // with no opt-in from the site, so tracking here would record views for visits
+    // that never happened. Wait for activation instead: if the prerender is
+    // discarded, prerenderingchange never fires and nothing is ever sent.
+    const doc = document as Document & { prerendering?: boolean };
+
+    if (doc.prerendering) {
+      doc.addEventListener('prerenderingchange', bootstrap, { once: true });
+    } else {
+      bootstrap();
     }
   }
 })(window as TrackerWindow);

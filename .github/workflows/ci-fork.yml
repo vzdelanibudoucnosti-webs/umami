@@ -1,0 +1,44 @@
+# Upstream's ci.yml is gated on `github.repository == 'umami-software/umami'`, so on a
+# fork it is skipped entirely and nothing validates a deploy. This workflow is the
+# fork-side equivalent. It lives in its own file so merges from upstream never conflict.
+name: CI (fork)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Prisma only needs a parseable URL to generate the client; nothing connects.
+  DATABASE_URL: "postgresql://user:pass@localhost:5432/dummy"
+  SKIP_DB_CHECK: 1
+  # Production on Vercel skips the GeoLite2 download unless BUILD_GEO is set
+  # (scripts/build-geo.js), so CI builds the same shape and saves a 32 MB fetch.
+  SKIP_BUILD_GEO: 1
+
+jobs:
+  build:
+    name: Test and build
+    # Never run on upstream itself — ci.yml already covers that repository.
+    if: github.repository != 'umami-software/umami'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+          run_install: false
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm test
+
+      - run: pnpm build
