@@ -446,64 +446,49 @@ WordPress nemá middleware. Varianty, v pořadí preference:
 
 ## 6. Plán změn
 
-### Krok 1 — nejdřív změřit, kolik vám adblock reálně bere *(týden, skoro žádná práce)*
+Kroky jsou v pořadí, v jakém se mají dělat. Krok 0 je hotový v tomhle repu.
 
-Server-side vrstva je řešení problému, jehož velikost zatím nikdo nezná. Než se
-postaví něco, co podle 4.3 může data zkreslit, je potřeba vědět, jestli se to vyplatí.
+### Krok 0 — odblokovat instanci ✅ *(hotovo, zbývají dvě env proměnné)*
 
-**Měření na `vzdelanibudoucnosti.cz`** (má nejvíc provozu i nejvíc paralelních měření):
-
-1. Za stejné období vzít **počet pageviews z Umami** a **počet requestů na tytéž cesty
-   z Vercel logů** (případně z Cloudflare u `pocitacedetem.cz`).
-2. Z Vercel čísel odečíst boty, prefetch a `/_next/*`.
-3. Rozdíl = **kolik měření vám dnes uniká** i s nasazenou `/s/` proxy.
-
-Rozhodovací pravidlo, dohodnuté předem, ať se pak nediskutuje nad výsledkem:
-
-| Rozdíl | Závěr |
+| | Stav |
 |---|---|
-| **do ~5 %** | Proxy stačí. Server-side pageviews **nestavět** — přineslo by to víc šumu než dat. Krok 6 (konverze) udělat stejně. |
-| **5–20 %** | Postavit hybrid podle sekce 5, ale jen na Next.js webech a s pilotem podle 1b. |
-| **nad 20 %** | Server-side má jasnou hodnotu, jít do toho včetně `pocitacedetem.cz` (5.3). |
+| Oprava 500 u chybějící geo databáze (F13) | ✅ `57f733070` — `src/lib/detect.ts` + 3 testy |
+| CI na forku (F9) | ✅ `.github/workflows/ci-fork.yml` |
+| Konfigurační runbook (F10) | ✅ `vzb-docs/umami-instance-config.md` |
+| **`BUILD_GEO=1`** ve Vercel env `vzb-umami` | ⬜ nutné, jakmile se začne posílat `payload.ip` |
+| **`CLIENT_IP_HEADER=x-vercel-forwarded-for`** (F14) | ⬜ zavře obcházení `IGNORE_IP`, udělat hned |
 
-**1b — pilot, jen pokud rozdíl vyjde nad 5 %.** Kandidát `hry.vzdelanibudoucnosti.cz`:
-jediný web s Umami a **žádnou jinou analytikou**, takže je na něm vidět čistý rozdíl.
-Middleware podle 5.1, klientský tracker běží **beze změny**, 48 hodin, pak porovnat:
+Obě proměnné jsou změna v dashboardu, ne v kódu. `CLIENT_IP_HEADER` nemá na nic
+negativní dopad a řeší bezpečnostní díru — nemá smysl s ním čekat.
 
-- kolik pageviews přibylo (= reálný zisk),
-- **kolik z toho je prefetch** — a jestli se vůbec dá odfiltrovat (viz 4.3 bod 1;
-  tohle je test, který rozhodne, jestli je middleware varianta použitelná),
-- sedí `sessionId` napříč vrstvami? (ověření 4.4)
+Po nasazení ověřit sondou z `umami-instance-config.md`:
+`true-client-ip: 8.8.8.8` má nově vracet **403**, ne 200.
 
-Teprve podle těch čísel vypnout klientský pageview.
+### Krok 1 — sdílený balíček `@vzb/analytics` *(jádro zadání „neřešit per web")*
 
-### Krok 6 — server-side konverze *(hodnota nezávislá na výsledku kroku 1)*
+Podle návrhu v 5.1. Vzniká vytažením `lib/analytics/` z hlavního webu, který má tuhle
+vrstvu zdaleka nejvyzrálejší — a hlavně má v komentářích zapsané chyby, které už jednou
+nastaly (fronta kvůli 0 ze 46 událostí, dedupe pageviews, `sanitizeBeacon` u Core Web
+Vitals, whitelist místo blacklistu).
 
-Tohle dělat **bez ohledu na to, jak dopadne měření**, protože je to ta část server-side
-trackingu, kde je hodnota jednoznačná a žádné riziko zkreslení nehrozí.
+Co se z hlavního webu vytáhne beze změny: fronta, dedupe, `toTrackedUrl`, `sanitizeBeacon`,
+`toEventProps`, `visitorHash`, `clientIp`.
+Co se stane konfigurací: `trackedHosts`, `blockedPathPrefixes`, `allowedQueryKeys`,
+`allowedPropKeys`, názvy událostí.
+Co se dopíše: **App Router varianta** `<UmamiAnalytics>` (hlavní web je Pages Router,
+většina ostatních bude App Router) a `sendUmamiEvent()` pro backend.
 
-Události, které vznikají na **backendu** — odeslaná registrace, potvrzená platba,
-dokončená objednávka — posílat do Umami přímo ze serverového handleru:
+**Nepřepisovat sémantiku fronty.** Adresa se musí zachytit v okamžiku *zařazení*,
+ne odeslání — přesně tahle chyba je v komentářích popsaná jako už jednou opravená.
 
-- Nikdo je nezablokuje a nezáleží na souhlasu s marketingovými cookies.
-- Nemají problém s prefetchem — vznikají jen při skutečné akci.
-- Handler má k dispozici IP i User-Agent původního requestu, takže se podle 4.4
-  napojí na správnou session návštěvníka.
-- Je to přesně model, který doporučují Segment i PostHog (viz 4.5).
+### Krok 2 — dorovnat pokrytí *(P0, dá se dělat souběžně s krokem 1)*
 
-Prakticky: `trackUmamiEvent('registrace_dokoncena', …)` dnes běží v prohlížeči a spolehne
-se na to, že uživatel po odeslání zůstane na stránce. Serverová varianta tuhle ztrátu
-odstraní — a konverze jsou to jediné číslo, u kterého se ztráta 5 % opravdu pozná.
-
-### Krok 2 — dorovnat pokrytí *(P0, nezávislé na kroku 1)*
-
-Čtyři weby na Umami podle runbooku `pridani-webu-do-umami.md`.
-**Na serveru Umami se nemění nic** — žádný deploy, žádná migrace, žádná env proměnná.
+Čtyři weby na Umami. **Na serveru Umami se nemění nic** — žádný deploy, žádná migrace.
 
 | Web | Poznámka |
 |---|---|
 | `knihovna.vzdelanibudoucnosti.cz` | P0 — dnes nula dat. Nejdřív zjistit repo a framework. |
-| `code.vzdelanibudoucnosti.cz` | Next.js/Vercel → proxy `/s/` i middleware jdou standardně |
+| `code.vzdelanibudoucnosti.cz` | Next.js/Vercel → proxy `/s/` standardně |
 | `pythongo.cz` | Next.js/Vercel → totéž |
 | `www.pocitacedetem.cz` | WordPress → viz 5.3 |
 
@@ -512,40 +497,61 @@ Pro každý web projít otázky ze sekce 1 runbooku, zejména **samostatný vs. 
 (u `pocitacedetem.cz` je produkční hostname s `www.` — bez něj se neměří nic
 a v konzoli není žádná hláška).
 
-### Krok 3 — uklidit duplicitní a mrtvá měření *(P1)*
+Pokud je balíček z kroku 1 hotový, jde to rychleji; pokud ne, dá se to udělat i postaru
+podle runbooku a na balíček přejít později.
+
+### Krok 3 — server-side konverze *(tam, kde má server-side jednoznačnou hodnotu)*
+
+Události, které vznikají na **backendu** — odeslaná registrace, potvrzená platba,
+dokončená objednávka — posílat do Umami přímo ze serverového handleru přes
+`sendUmamiEvent()` z kroku 1.
+
+- Nikdo je nezablokuje a nezávisí na souhlasu s marketingovými cookies.
+- Nemají problém s prefetchem ani s boty — vznikají jen při skutečné akci.
+- Handler má IP i User-Agent původního requestu, takže se podle 4.4 napojí na správnou
+  session návštěvníka.
+- Je to model, který doporučují Segment i PostHog (4.5).
+
+Konkrétně na hlavním webu: `registration_submit` se dnes posílá z prohlížeče
+(`components/RegisterModal/common.ts`) a spoléhá na to, že uživatel po odeslání zůstane
+na stránce — u platební brány přitom rovnou odchází na Comgate. Serverová varianta
+tuhle ztrátu odstraní.
+
+**Předpoklad:** `BUILD_GEO=1` z kroku 0, jinak konverze nebudou mít geolokaci.
+
+### Krok 4 — uklidit duplicitní a mrtvá měření *(P1)*
 
 1. **`pythongo.cz`: odstranit `UA-133426578-2`** a `analytics.js`. Bez podmínek —
-   ta property je od července 2023 mrtvá, o nic nepřijdete.
+   ta property je od července 2023 mrtvá.
 2. **`pocitacedetem.cz`: jedna cesta do GA4**, ne dvě. Doporučeně GTM (`GTM-TLTMG2P`),
    MonsterInsights vypnout.
 3. **Vercel Insights vypnout** na `vzdelanibudoucnosti.cz`, `code.*` a `pythongo.cz`;
    **Cloudflare Insights** na `pocitacedetem.cz`.
-4. **`/api/px` na hlavním webu (F7):** rozhodnout. Buď mu doplnit stejné vyloučení
-   interního provozu jako má Umami, nebo ho po nasazení server-side vrstvy zrušit —
-   middleware dělá totéž a navíc správně.
+4. **`/api/px` na hlavním webu (F7):** rozhodnout, co s ním. Má vlastní bot filtr, vlastní
+   `visitor_hash` a napojení na atribuci registrací — **není to duplikát Umami, ale jiná
+   vrstva**. Minimum: doplnit mu vyloučení interního provozu, aby se čísla dala srovnat.
 
-### Krok 4 — provozní hygiena instance *(P2)*
+### Krok 5 — provozní hygiena *(P2)*
 
-1. **Zapnout CI na forku (F9).** Vlastní `.github/workflows/ci-fork.yml`, který pouští
-   `pnpm test` a `pnpm build` se `SKIP_DB_CHECK=1`. Čistší než upravovat `ci.yml`,
-   protože nekoliduje s upstream merge. **Jediná změna v tomhle plánu, která sahá
-   do kódu tohoto repa.**
-2. **Retence dat (F11).** Umami ji neumí → externí scheduled job (Vercel Cron + route
-   mazající `website_event` starší než N měsíců ve schématu `analytics`).
-   **Priorita roste s krokem 1** — server-side zvedne objem zápisů. Nejdřív ale
-   změřit reálný růst, ne odhadovat.
-3. **Zdokumentovat Vercel env do gitu (F10).** Ne hodnoty, jen seznam a význam:
-   `?schema=analytics` na obou URL, `TRACKER_SCRIPT_NAME=stats.js` včetně přípony,
-   `COLLECT_API_ENDPOINT` nikdy nenastavovat.
-4. **Jak se měření ověřuje (F12).** Do runbooku: testuje se z mobilních dat, ne
-   z kanceláře, protože `IGNORE_IP` vrací 403 a dashboard zůstane prázdný.
+1. **Retence dat (F11).** Externí scheduled job (Vercel Cron + route mazající
+   `website_event` starší než N měsíců ve schématu `analytics`). Nejdřív ale změřit
+   reálný růst — s šesti weby to nemusí být letos aktuální.
+2. **Ověřování měření (F12).** Do runbooku doplnit nemutující sondu
+   z `umami-instance-config.md` a fakt, že se testuje z mobilních dat, ne z kanceláře.
 
-### Krok 5 — aktualizovat runbook *(malá změna, velký dopad)*
+### Krok 6 — aktualizovat runbook *(malá změna, velký dopad)*
 
 `pridani-webu-do-umami.md`: opravit sekci 0 (`hry.*` už na Umami **je**), doplnit
-tabulku pokrytí ze sekce 1 a novou kapitolu o serverové vrstvě podle sekce 5.
+tabulku pokrytí ze sekce 1 a nahradit kapitolu „kopíruj `umami.ts`" odkazem na balíček
+z kroku 1.
 
----
+### Volitelně — změřit, kolik měření uniká
+
+Už to není brána pro nic v tomhle plánu (middleware pageviews padly), ale je to levné
+a užitečné číslo: porovnat pageviews z Umami proti requestům na tytéž cesty z Vercel logů
+za stejné období, po odečtení botů, prefetche a `/_next/*`. Rozdíl je to, co `/s/` proxy
+nezachytí. Kdyby vyšel výrazně vysoký, stojí za to se k serverovým pageviews vrátit —
+ale s vědomím F15 a 4.3.
 
 ## 7. Co v tomhle plánu vědomě není
 
@@ -564,29 +570,33 @@ tabulku pokrytí ze sekce 1 a novou kapitolu o serverové vrstvě podle sekce 5.
 ## 8. Doporučené pořadí
 
 ```
-Krok 1 (změřit ztrátu)     ──►  rozhodne, jestli se Krok 1b vůbec dělá
-Krok 2 (dorovnat pokrytí)  ← nezávislé, dá se začít hned
-Krok 6 (server-side konverze) ← nezávislé na výsledku měření, dělat tak jako tak
-Krok 3 (úklid)             ← po rozhodnutí z kroku 1
-Krok 4 (hygiena)           ← nezávislé; 4.1 je na 10 minut
-Krok 5 (runbook)           ← průběžně
+Krok 0 (instance)   ✅ hotovo v repu; zbývají 2 env proměnné — 10 minut
+   │
+   ├─ Krok 1 (balíček @vzb/analytics) ──┬─ Krok 2 (dorovnat pokrytí)
+   │                                    └─ Krok 3 (server-side konverze)
+   │
+   ├─ Krok 4 (úklid duplicit)   ← nezávislé
+   ├─ Krok 5 (hygiena)          ← nezávislé
+   └─ Krok 6 (runbook)          ← průběžně
 ```
 
-**Rychlá hodnota za málo práce:** smazat mrtvý UA z `pythongo.cz` (F4), zapnout CI (F9),
-opravit runbook (F8) — dohromady pod hodinu.
+**Udělat hned (pod hodinu):** `CLIENT_IP_HEADER=x-vercel-forwarded-for` (zavře F14),
+smazat mrtvý UA z `pythongo.cz` (F4), opravit runbook (F8).
 
-**Největší hodnota:** Krok 2, protože o čtyřech ze šesti webů dnes nevíte nic.
-Žádná architektura měření to nenahradí.
+**Největší hodnota:** Krok 2. O čtyřech ze šesti webů dnes nevíte nic a žádná
+architektura měření to nenahradí.
 
-**Co nedělat:** nestavět server-side pageviews dřív, než bude hotový Krok 1. Podle 4.5
-je `/s/` proxy, kterou už máte, hlavní obrana proti adblocku — a podle 4.3 může
-middleware vrstva data spíš zkreslit než zpřesnit, dokud se neprokáže, že prefetch
-jde odfiltrovat.
+**Jádro zadání „neřešit per web":** Krok 1. Bez něj se každý další web řeší kopírováním
+`lib/analytics/` a šest kopií se rozejde.
 
-**Nejrizikovější místo, pokud se server-side stavět bude:** sanitizace URL (5.1).
-Dnešní whitelist běží v prohlížeči a middleware ho obejde. Když se přenese špatně,
-poletí do Umami tokeny, PINy a e-maily z adres. Jediná část, která si zaslouží ruční
-test na každém webu zvlášť.
+**Co nedělat:** nestavět pageviews z middleware. Není to názor — hlavní web to už jednou
+zavedl a zrušil (F15, 16 656 invokací za 24 h) a prefetch se v middleware spolehlivě
+odfiltrovat nedá (4.3).
+
+**Nejrizikovější místo celého plánu:** sanitizace URL v `toTrackedUrl` (5.1). Je to
+whitelist, ne blacklist, a je to jediné místo, kde se dá způsobit únik osobních údajů —
+`/online/[token]`, `?email=`, herní PINy. Při přenosu do balíčku si zaslouží vlastní testy
+a ruční ověření na každém webu zvlášť.
 
 ---
 
