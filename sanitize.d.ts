@@ -16,7 +16,9 @@ export declare function toTrackedUrl(config: AnalyticsConfig, url: string): stri
 /** The referrer is the second way a token or an e-mail gets out. Only the origin survives. */
 export declare function toTrackedReferrer(referrer: unknown): string;
 /**
- * Whitelist, not blocklist. Revenue is the single exception: Umami fills its revenue
+ * Whitelist, not blocklist, and the two lists are separated by type: a key in
+ * `allowedPropKeys` survives only as a string, one in `allowedNumberPropKeys` only as a
+ * finite number. Revenue is the single exception: Umami fills its revenue
  * table from `revenue` + `currency`, and without them it can only count conversions,
  * not report on them. Because every widening of the whitelist weakens the guard against
  * leaking personal data, the pair is held to hard rules — a finite positive amount in a

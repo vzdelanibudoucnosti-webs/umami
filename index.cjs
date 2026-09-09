@@ -45,7 +45,8 @@ function toPathAndQuery(raw) {
   }
 }
 function toTrackedUrl(config, url) {
-  const [path, search] = toPathAndQuery(url).split("?");
+  const [rawPath, search] = toPathAndQuery(url).split("?");
+  const path = config.normalizePath ? config.normalizePath(rawPath) : rawPath;
   if (config.blockedPathPrefixes.some((prefix) => path.startsWith(prefix))) {
     return null;
   }
@@ -84,6 +85,12 @@ function toEventProps(config, props) {
     const value = record[key];
     if (typeof value === "string" && value.trim() !== "") {
       sanitized[key] = value.trim().slice(0, maxLength);
+    }
+  }
+  for (const key of config.allowedNumberPropKeys ?? []) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      sanitized[key] = value;
     }
   }
   const { revenue, currency } = props;

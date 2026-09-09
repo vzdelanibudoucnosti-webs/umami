@@ -12,6 +12,17 @@ export interface AnalyticsConfig {
      */
     trackedHosts: string[];
     /**
+     * Collapse the identifying segment of a path into a placeholder, e.g.
+     * `/hry/cyber-duel/play/AB12` into `/hry/cyber-duel/play/:pin`. Runs before the
+     * blocklist below, so a prefix there is matched against the normalised path.
+     *
+     * This is not a weaker `blockedPathPrefixes` but the answer to a different question.
+     * A path whose secret nobody needs measured is blocked. A path where the page holding
+     * the secret *is* the funnel — a game lobby that is joined by PIN — cannot be, or the
+     * whole flow goes unmeasured; normalising keeps the aggregate and drops the secret.
+     */
+    normalizePath?: (path: string) => string;
+    /**
      * Path prefixes that must never be measured. This is a blocklist on top of the
      * query whitelist below, for paths that carry a secret in the path itself —
      * access tokens, game PINs, admin.
@@ -25,6 +36,12 @@ export interface AnalyticsConfig {
     allowedQueryKeys: string[];
     /** Event property keys allowed to leave. Same whitelist rule as the query keys. */
     allowedPropKeys: string[];
+    /**
+     * Numeric event property keys allowed to leave. Held apart from `allowedPropKeys`
+     * rather than folded into it because the type decides how Umami stores the value:
+     * a number is a figure it can average, a string is only a label.
+     */
+    allowedNumberPropKeys?: string[];
     /** Cap on a single property value, to keep one bad caller from shipping a document. */
     maxPropLength?: number;
     /** Upper bound for `revenue`, as a sanity check against a misplaced decimal point. */
