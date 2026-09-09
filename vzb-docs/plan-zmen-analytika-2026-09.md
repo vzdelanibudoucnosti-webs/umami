@@ -129,6 +129,41 @@ Tohle je jádro zadání, tak k němu rovnou to nepříjemné:
 *úplnost* (nikdo vám měření nezablokuje), ale zhoršuje *přesnost* (napočítá věci,
 které nejsou návštěvy). Obojí najednou dá až kombinace obou vrstev — sekce 5.
 
+### 4.0 BLOCKER: server-side tracking dnes na naší instanci vrací 500
+
+**Ověřeno na živé instanci 2026-09-09, ne odvozeno.** Nemutující sonda
+(`type:"identify"` bez `id` i `data` — nic nezapisuje, ale projde detekcí klienta):
+
+```
+A) identify BEZ payload.ip  → HTTP 403   (IGNORE_IP, čekaný stav z naší sítě)
+B) identify S  payload.ip   → HTTP 500   {"code":"server-error"}
+```
+
+Příčina je řetěz tří věcí, každá sama o sobě neškodná:
+
+1. `scripts/build-geo.js:17` — **na Vercelu se GeoLite2 databáze nestahuje**, pokud není
+   nastaveno `BUILD_GEO`: „Vercel environment detected. Skipping geo setup."
+2. `src/lib/detect.ts` — když přijde `payload.ip`, zavolá se `getLocation(..., skipHeaders: true)`,
+   což **přeskočí Vercel geo hlavičky** a spadne rovnou na databázový lookup.
+3. `maxmind.open()` nad neexistujícím souborem **vyhodí výjimku a nikdo ji nechytá** →
+   propadne až do `catch` v `route.ts:380` → `serverError`.
+
+Dnešní klientský tracker `payload.ip` neposílá, takže se bod 2 nikdy nespustí a všechno
+funguje. **Jakmile se přidá serverová vrstva, přestane fungovat úplně všechno** — a protože
+se reader cachuje v `globalThis`, selže první request a všechny další taky.
+
+**To je taky odpověď na „proč to nikdo nemá hotové".** Není to konfigurační detail,
+je to chyba v Umami: chybějící volitelná databáze nemá dělat z requestu 500.
+
+Řešení má dvě části a **obě jsou v tomhle repu už hotové** (viz sekce 6, Krok 0):
+
+- **Oprava Umami:** `getLocation` chybějící databázi zaloguje a pokračuje bez geolokace
+  místo výjimky, a selhání si zapamatuje, aby se lookup nezkoušel při každém requestu.
+- **Konfigurace:** `BUILD_GEO=1` ve Vercel env instance, aby geolokace u serverových
+  událostí vůbec vznikla. Bez toho by země/město u server-side událostí zůstaly prázdné.
+  GeoLite2-City je 32 MB komprimovaně — přidá se do build artefaktu, což je potřeba ověřit
+  proti limitu velikosti funkce.
+
 ### 4.1 Co server-side skutečně vyřeší
 
 Ověřeno ve zdrojáku instance, ne odhad:
