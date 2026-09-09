@@ -29,6 +29,8 @@ const config: AnalyticsConfig = {
   blockedPathPrefixes: ['/online/', '/admin', '/api/'],
   allowedQueryKeys: ['utm_source', 'utm_medium', 'utm_campaign', 'gclid', 'fbclid'],
   allowedPropKeys: ['course_slug', 'school'],
+  allowedNumberPropKeys: ['score'],
+  normalizePath: path => path.replace(/^(\/hry\/[^/]+\/play)\/[^/]+/, '$1/:pin'),
 }
 
 export const analytics = createClientAnalytics(config)
@@ -37,9 +39,23 @@ export const serverAnalytics = createServerAnalytics(config, {
 })
 ```
 
-Both whitelists are **whitelists, not blocklists**: a key that is not listed never leaves
+Every whitelist is a **whitelist, not a blocklist**: a key that is not listed never leaves
 the browser. Keep the UTM parameters and click ids in `allowedQueryKeys` or campaign
-attribution disappears.
+attribution disappears. `allowedPropKeys` and `allowedNumberPropKeys` are split by type
+rather than merged, because the type is what decides how Umami stores the value — a number
+is a figure it can average, a string is only a label.
+
+`revenue` and `currency` are reserved and neither list can reach them; they are sent only
+through the rules below.
+
+`normalizePath` is for an address where the page is the funnel but a segment of it is a
+secret: a game lobby joined by PIN, a share link. Blocking such a path leaves the flow
+unmeasured, so the segment is collapsed into a placeholder instead. It runs before
+`blockedPathPrefixes`, so a blocked prefix is matched against the normalised path, and it
+applies to everything on the way out — pageviews, events, the Core Web Vitals beacon and
+the server sender alike. It is handed the path alone and anything from a `?` on is cut off
+the result, so it cannot be used to get a query past `allowedQueryKeys`; if it throws, the
+payload is dropped rather than sent unnormalised.
 
 ## Client
 
@@ -103,7 +119,7 @@ traffic.
 pnpm test          # vitest
 pnpm typecheck
 pnpm build         # tsup for js, tsc for the declarations
-pnpm publish-dist  # force-push the build to the analytics-dist branch
+pnpm publish-dist  # append the build to the analytics-dist branch
 ```
 
 Declarations come from `tsc`, not tsup's dts worker, which resolves the repository root

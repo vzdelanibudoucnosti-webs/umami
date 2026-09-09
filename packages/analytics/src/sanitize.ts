@@ -5,6 +5,14 @@ const DEFAULT_MAX_REVENUE = 1_000_000;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
 
 /**
+ * Owned by the revenue block in toEventProps, which holds them to rules a plain
+ * whitelist entry would skip: sent only as a pair, capped, rounded to cents. Listing
+ * either key in allowedPropKeys or allowedNumberPropKeys must not become a way around
+ * that — and listing `revenue` as an ordinary number is the obvious thing to try.
+ */
+const RESERVED_PROP_KEYS = new Set(['revenue', 'currency']);
+
+/**
  * Reduce an absolute URL to path + query.
  *
  * The blocklist below matches prefixes against the start of the string, so
@@ -23,13 +31,42 @@ export function toPathAndQuery(raw: string): string {
 }
 
 /**
+ * The site's own `normalizePath`, run inside the guard the rest of this module is.
+ *
+ * Only the path may be rewritten. A `?` in the result would carry a raw query straight
+ * past `allowedQueryKeys` — the one thing this file exists to prevent — and a normaliser
+ * accidentally written over the whole URL rather than the path is an easy way to get one.
+ *
+ * A throw fails closed, and returns null rather than the raw path: the raw path is
+ * exactly the address the callback was configured to redact. Letting it escape instead is
+ * not an option either, because config is foreign code on the hot path of every pageview,
+ * every event and every beacon, and measurement must not break the page.
+ */
+function applyNormalizePath(config: AnalyticsConfig, path: string): string | null {
+  if (!config.normalizePath) {
+    return path;
+  }
+
+  try {
+    return config.normalizePath(path).split('?')[0];
+  } catch (e) {
+    console.error(e);
+
+    return null;
+  }
+}
+
+/**
  * Returns null for a page that must not be measured, so the caller sends nothing at all
  * rather than sending a redacted version of it.
  */
 export function toTrackedUrl(config: AnalyticsConfig, url: string): string | null {
-  const [path, search] = toPathAndQuery(url).split('?');
+  const [rawPath, search] = toPathAndQuery(url).split('?');
+  // Before the blocklist, so a blocked prefix is matched against the normalised path
+  // and a site cannot end up with two spellings of the same rule.
+  const path = applyNormalizePath(config, rawPath);
 
-  if (config.blockedPathPrefixes.some(prefix => path.startsWith(prefix))) {
+  if (path === null || config.blockedPathPrefixes.some(prefix => path.startsWith(prefix))) {
     return null;
   }
 
@@ -67,7 +104,10 @@ export function toTrackedReferrer(referrer: unknown): string {
 }
 
 /**
- * Whitelist, not blocklist. Revenue is the single exception: Umami fills its revenue
+ * Whitelist, not blocklist, and the two lists are separated by type: a key in
+ * `allowedPropKeys` survives only as a string, one in `allowedNumberPropKeys` only as a
+ * finite number, and a key on both lists is taken either way. Revenue is the single
+ * exception, and neither list can reach it: Umami fills its revenue
  * table from `revenue` + `currency`, and without them it can only count conversions,
  * not report on them. Because every widening of the whitelist weakens the guard against
  * leaking personal data, the pair is held to hard rules — a finite positive amount in a
@@ -88,8 +128,24 @@ export function toEventProps(config: AnalyticsConfig, props?: EventProps): Sanit
   for (const key of config.allowedPropKeys) {
     const value = record[key];
 
+    if (RESERVED_PROP_KEYS.has(key)) {
+      continue;
+    }
+
     if (typeof value === 'string' && value.trim() !== '') {
       sanitized[key] = value.trim().slice(0, maxLength);
+    }
+  }
+
+  for (const key of config.allowedNumberPropKeys ?? []) {
+    const value = record[key];
+
+    if (RESERVED_PROP_KEYS.has(key)) {
+      continue;
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      sanitized[key] = value;
     }
   }
 
