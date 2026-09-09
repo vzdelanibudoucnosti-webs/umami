@@ -145,6 +145,42 @@ describe('normalizePath', () => {
     ).toEqual({ url: '/hry/cyber-duel/play/:pin', referrer: 'https://hry.example.cz' });
   });
 
+  // The callback is handed the path alone, so a query cannot be reached through it.
+  // A normaliser written over the whole URL by mistake must not become a way past
+  // allowedQueryKeys — the one guard the query has.
+  test('never lets the callback reach the query', () => {
+    const smuggling: AnalyticsConfig = {
+      ...gamesConfig,
+      normalizePath: path => `${path}?e=parent@example.com`,
+    };
+
+    expect(toTrackedUrl(smuggling, '/kurzy')).toBe('/kurzy');
+    expect(toTrackedUrl(smuggling, '/kurzy?utm_source=meta')).toBe('/kurzy?utm_source=meta');
+  });
+
+  // Config is foreign code on the hot path of every pageview, event and beacon. It fails
+  // closed rather than falling back to the raw path, which is the very address the
+  // callback was configured to redact.
+  test('sends nothing at all when the callback throws, and does not break the caller', () => {
+    const broken: AnalyticsConfig = {
+      ...gamesConfig,
+      normalizePath: path => path.split('/')[9].toUpperCase(),
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    expect(toTrackedUrl(broken, '/hry/cyber-duel/play/AB12')).toBeNull();
+
+    const analytics = createClientAnalytics(broken);
+    const track = vi.fn();
+    window.umami = { track } as never;
+
+    expect(() => analytics.trackPageview('/hry/cyber-duel/play/AB12')).not.toThrow();
+    expect(track).not.toHaveBeenCalled();
+
+    window.umami = undefined;
+    vi.restoreAllMocks();
+  });
+
   test('reaches an event, which reads its address off window.location', () => {
     const analytics = createClientAnalytics(gamesConfig);
     const track = vi.fn();
@@ -176,6 +212,37 @@ describe('allowedNumberPropKeys', () => {
 
   test('still drops a number whose key is on neither list', () => {
     expect(toEventProps(gamesConfig, { pin: 1234 } as unknown as EventProps)).toEqual({});
+  });
+
+  test('takes a key on both lists either way', () => {
+    const both: AnalyticsConfig = {
+      ...gamesConfig,
+      allowedPropKeys: ['result'],
+      allowedNumberPropKeys: ['result'],
+    };
+
+    expect(toEventProps(both, { result: 'win' } as unknown as EventProps)).toEqual({
+      result: 'win',
+    });
+    expect(toEventProps(both, { result: 3 } as unknown as EventProps)).toEqual({ result: 3 });
+  });
+
+  // Revenue is held to rules a plain whitelist entry would skip — the pair, the ceiling,
+  // the rounding — so neither list may reach it. Listing it as an ordinary number is the
+  // obvious thing to try, and it used to work.
+  test('cannot be used to smuggle revenue past its own rules', () => {
+    const greedy: AnalyticsConfig = {
+      ...gamesConfig,
+      allowedPropKeys: ['currency'],
+      allowedNumberPropKeys: ['revenue'],
+    };
+
+    expect(toEventProps(greedy, { revenue: 999_999_999.987 } as EventProps)).toEqual({});
+    expect(toEventProps(greedy, { currency: 'czk' } as EventProps)).toEqual({});
+    expect(toEventProps(greedy, { revenue: 1199.9999999999998, currency: 'CZK' })).toEqual({
+      revenue: 1200,
+      currency: 'CZK',
+    });
   });
 });
 
@@ -430,6 +497,16 @@ describe('server', () => {
     await server.sendEvent({ ...input, url: 'https://example.cz/admin/registrace' });
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // Both senders go through toTrackedUrl, so a site configures normalisation once
+  // rather than once per sender.
+  test('normalises the path the same way the client does', async () => {
+    const games = createServerAnalytics(gamesConfig, { hostUrl: HOST });
+
+    await games.sendEvent({ ...input, url: 'https://hry.example.cz/hry/cyber-duel/result/AB12' });
+
+    expect(sentBody().payload.url).toBe('/hry/cyber-duel/result/:pin');
   });
 
   // Measurement must never break a conversion.
