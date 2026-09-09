@@ -18,7 +18,8 @@ export declare function toTrackedReferrer(referrer: unknown): string;
 /**
  * Whitelist, not blocklist, and the two lists are separated by type: a key in
  * `allowedPropKeys` survives only as a string, one in `allowedNumberPropKeys` only as a
- * finite number. Revenue is the single exception: Umami fills its revenue
+ * finite number, and a key on both lists is taken either way. Revenue is the single
+ * exception, and neither list can reach it: Umami fills its revenue
  * table from `revenue` + `currency`, and without them it can only count conversions,
  * not report on them. Because every widening of the whitelist weakens the guard against
  * leaking personal data, the pair is held to hard rules — a finite positive amount in a

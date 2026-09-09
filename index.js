@@ -2,6 +2,7 @@
 var DEFAULT_MAX_PROP_LENGTH = 200;
 var DEFAULT_MAX_REVENUE = 1e6;
 var CURRENCY_PATTERN = /^[A-Z]{3}$/;
+var RESERVED_PROP_KEYS = /* @__PURE__ */ new Set(["revenue", "currency"]);
 function toPathAndQuery(raw) {
   try {
     const parsed = new URL(raw, "https://placeholder.invalid");
@@ -10,10 +11,21 @@ function toPathAndQuery(raw) {
     return raw;
   }
 }
+function applyNormalizePath(config, path) {
+  if (!config.normalizePath) {
+    return path;
+  }
+  try {
+    return config.normalizePath(path).split("?")[0];
+  } catch (e) {
+    console.error(e);
+    return null;
+  }
+}
 function toTrackedUrl(config, url) {
   const [rawPath, search] = toPathAndQuery(url).split("?");
-  const path = config.normalizePath ? config.normalizePath(rawPath) : rawPath;
-  if (config.blockedPathPrefixes.some((prefix) => path.startsWith(prefix))) {
+  const path = applyNormalizePath(config, rawPath);
+  if (path === null || config.blockedPathPrefixes.some((prefix) => path.startsWith(prefix))) {
     return null;
   }
   if (!search) {
@@ -49,12 +61,18 @@ function toEventProps(config, props) {
   const record = props;
   for (const key of config.allowedPropKeys) {
     const value = record[key];
+    if (RESERVED_PROP_KEYS.has(key)) {
+      continue;
+    }
     if (typeof value === "string" && value.trim() !== "") {
       sanitized[key] = value.trim().slice(0, maxLength);
     }
   }
   for (const key of config.allowedNumberPropKeys ?? []) {
     const value = record[key];
+    if (RESERVED_PROP_KEYS.has(key)) {
+      continue;
+    }
     if (typeof value === "number" && Number.isFinite(value)) {
       sanitized[key] = value;
     }
