@@ -8,9 +8,12 @@
  *
  *   yarn add "git+https://github.com/<owner>/umami.git#analytics-dist"
  *
- * The branch holds only build output. It is force-pushed on every publish and has no
- * shared history with master on purpose — nothing here should ever appear in a diff
- * against upstream.
+ * The branch holds only build output and shares no history with master on purpose —
+ * nothing here should ever appear in a diff against upstream.
+ *
+ * Each publish appends a commit rather than replacing the branch. A consumer's
+ * yarn.lock pins the exact commit it installed, so force-pushing would orphan it and
+ * `yarn install --frozen-lockfile` would eventually fail once the commit is collected.
  *
  * Usage: node scripts/publish-dist.mjs [--dry-run]
  */
@@ -61,17 +64,39 @@ const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'vzb-analytics-'));
 try {
   fs.cpSync(distDir, stage, { recursive: true });
   fs.writeFileSync(path.join(stage, 'package.json'), `${JSON.stringify(publishedPkg, null, 2)}\n`);
+  // Vercel watches every branch in this repository, so a push here starts a build of a
+  // branch that holds no Next.js app and it fails with "No Next.js version detected".
+  // Two independent guards, because the noise is a failed deployment notification each
+  // time the package is published: vercel.json turns deployments off for this branch,
+  // and the commit message carries the skip marker Vercel honours on its own.
+  fs.writeFileSync(
+    path.join(stage, 'vercel.json'),
+    `${JSON.stringify({ git: { deploymentEnabled: { [BRANCH]: false } } }, null, 2)}\n`,
+  );
   fs.writeFileSync(
     path.join(stage, 'README.md'),
     `# ${pkg.name}\n\nBuild output only. Source and tests live in \`packages/analytics\` on \`master\`.\nBuilt from ${sourceCommit}.\n`,
   );
 
   run('git', ['init', '-q', '-b', BRANCH], stage);
+  run('git', ['remote', 'add', 'origin', originUrl], stage);
+
+  // Continue the existing branch when there is one, so previously pinned commits stay
+  // reachable. Only the very first publish starts from nothing.
+  let hasHistory = false;
+  try {
+    run('git', ['fetch', '-q', '--depth', '50', 'origin', BRANCH], stage);
+    run('git', ['reset', '-q', '--soft', 'FETCH_HEAD'], stage);
+    hasHistory = true;
+  } catch {
+    console.log(`No ${BRANCH} branch yet, starting one.`);
+  }
+
   run('git', ['add', '-A'], stage);
   run(
     'git',
     ['-c', 'user.name=vzb-analytics', '-c', 'user.email=noreply@vzdelanibudoucnosti.cz',
-     'commit', '-q', '-m', `build: ${pkg.name}@${pkg.version} from ${sourceCommit}`],
+     'commit', '-q', '-m', `build: ${pkg.name}@${pkg.version} from ${sourceCommit} [skip ci]`],
     stage,
   );
 
@@ -81,10 +106,14 @@ try {
     process.exit(0);
   }
 
-  run('git', ['remote', 'add', 'origin', originUrl], stage);
-  run('git', ['push', '-q', '--force', 'origin', `${BRANCH}:${BRANCH}`], stage);
+  run('git', ['push', '-q', 'origin', `HEAD:${BRANCH}`], stage);
 
-  console.log(`Published ${pkg.name}@${pkg.version} to ${BRANCH} (built from ${sourceCommit}).`);
+  const head = run('git', ['rev-parse', '--short', 'HEAD'], stage);
+
+  console.log(
+    `Published ${pkg.name}@${pkg.version} to ${BRANCH} as ${head} ` +
+      `(built from ${sourceCommit}, ${hasHistory ? 'appended' : 'new branch'}).`,
+  );
 } finally {
   fs.rmSync(stage, { recursive: true, force: true });
 }
