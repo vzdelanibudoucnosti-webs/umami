@@ -167,6 +167,44 @@ curl -s https://analytics.vzdelanibudoucnosti.cz/api/config
 
 ---
 
+## MCP (od v3.4.0)
+
+Oficiální MCP server ([docs](https://docs.umami.is/docs/mcp)) běží přímo v instanci na
+`https://analytics.vzdelanibudoucnosti.cz/mcp`. Jen čte, jde přes stejné API a oprávnění
+jako API klíč, do DB nesahá.
+
+| Proměnná | Hodnota | Proč |
+|---|---|---|
+| `MCP_ENABLED` | `1` | Bez ní `/mcp` vrací 404 (`src/app/mcp/route.ts`). Jiná hodnota než `1` (ani `true`) to nezapne. |
+
+Přístup = API klíč (`umami_…`) z **Settings → API keys** uživatele, pod kterým AI čte.
+Doporučení: samostatný uživatel s rolí **view-only**, přidaný jen k webům, které má AI vidět.
+Odpojení = smazat klíč. Klíč se ukáže jen jednou a do repa ani Vercelu nepatří.
+
+Připojení klientů (Claude Code, Cursor) popisuje repo webu:
+`docs/agenti/umami-mcp.md`.
+
+---
+
+## Upgrade z upstreamu
+
+Fork drží vlastní commity (tracker, docs, `packages/analytics`), proto se upstream
+**merguje**, ne rebasuje: `git fetch upstream --tags && git merge vX.Y.Z`.
+
+- **`pnpm-workspace.yaml`**: vyloučený je jen `!packages/analytics`. Od v3.4.0 jsou
+  `packages/api-client` a `packages/mcp` workspace závislosti aplikace — širší `!packages/**`
+  rozbije `pnpm install`.
+- **`src/tracker/index.ts`**: náš odklad page view u prerenderované stránky (`bootstrap`
+  + `prerenderingchange`) musí merge přežít. Ověření: `grep prerenderingchange public/script.js`
+  po `pnpm build:tracker`.
+- **Vercel**: od v3.4.0 `vercel.json` instaluje přes `npx pnpm@12.3.4` (`engines.pnpm`).
+  Migrace (`prisma/migrations`) pouští build sám přes `check:db`.
+- **Měření**: `/api/send`, `/stats.js` i `/script.js` zůstávají. `sessionId` od v3.4.0 bere
+  i `distinctId`, prázdný ho ale nemění (`src/lib/crypto.test.ts`), takže session
+  anonymních návštěv po nasazení nenavazují znovu.
+
+---
+
 ## Jak bezpečně sondovat produkci
 
 Při ladění měření je potřeba rozlišit „endpoint nefunguje" od „moje IP je blokovaná".
