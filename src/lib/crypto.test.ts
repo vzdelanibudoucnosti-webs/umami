@@ -86,4 +86,14 @@ describe('uuid', () => {
 
     vi.unstubAllEnvs();
   });
+
+  test('keeps the anonymous session id when an empty distinct id is appended', () => {
+    vi.stubEnv('APP_SECRET', 'test-secret');
+
+    expect(uuid('website', '1.2.3.4', 'agent', 'salt', '')).toBe(
+      uuid('website', '1.2.3.4', 'agent', 'salt'),
+    );
+
+    vi.unstubAllEnvs();
+  });
 });
